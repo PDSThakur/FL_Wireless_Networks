@@ -242,6 +242,129 @@ def get_backdoor_test_loaders(
     return pixel_loader, semantic_loader
 
 
+class PoisonedClientTrainDataset(Dataset):
+    """
+    Local train dataset wrapper used by malicious clients.
+
+    Supported attacks:
+      - "pixel": add trigger + relabel selected samples to target_label
+      - "semantic": relabel selected source_label samples to target_label
+    """
+
+    def __init__(
+        self,
+        base_dataset,
+        dataset_name: str,
+        attack_type: str,
+        poison_rate: float,
+        target_label: int,
+        source_label: int = 1,
+        trigger_size: int = 3,
+        trigger_value: float = 1.0,
+        seed: int = 42,
+    ):
+        self.base_dataset = base_dataset
+        self.dataset_name = dataset_name.lower()
+        self.attack_type = attack_type.lower()
+        self.poison_rate = float(poison_rate)
+        self.target_label = int(target_label)
+        self.source_label = int(source_label)
+        self.trigger_size = int(trigger_size)
+        self.trigger_values = _normalized_trigger_values(self.dataset_name, trigger_value)
+
+        if self.attack_type not in ("pixel", "semantic"):
+            raise ValueError(f"Unsupported attack_type={attack_type}. Use 'pixel' or 'semantic'.")
+        if not (0.0 <= self.poison_rate <= 1.0):
+            raise ValueError(f"poison_rate must be in [0,1], got {self.poison_rate}")
+
+        labels = []
+        for i in range(len(self.base_dataset)):
+            _, label = self.base_dataset[i]
+            labels.append(int(label))
+        labels = np.array(labels, dtype=np.int64)
+
+        if self.attack_type == "pixel":
+            eligible = np.where(labels != self.target_label)[0]
+        else:
+            eligible = np.where(labels == self.source_label)[0]
+
+        rng = np.random.RandomState(seed)
+        num_eligible = int(len(eligible))
+        num_poison = int(np.floor(self.poison_rate * num_eligible))
+        if self.poison_rate > 0.0 and num_eligible > 0 and num_poison == 0:
+            num_poison = 1
+        num_poison = min(num_poison, num_eligible)
+
+        if num_poison > 0:
+            poisoned_positions = rng.choice(eligible, size=num_poison, replace=False).tolist()
+            self.poisoned_positions = set(int(x) for x in poisoned_positions)
+        else:
+            self.poisoned_positions = set()
+
+        self.num_eligible = num_eligible
+        self.num_poisoned = len(self.poisoned_positions)
+
+    def __len__(self):
+        return len(self.base_dataset)
+
+    def __getitem__(self, idx):
+        image, label = self.base_dataset[idx]
+        if idx in self.poisoned_positions:
+            if self.attack_type == "pixel":
+                image = _apply_pixel_trigger(image, self.trigger_values, self.trigger_size)
+            label = self.target_label
+        return image, label
+
+
+def build_poisoned_client_train_loader(
+    train_loader: DataLoader,
+    dataset_name: str,
+    attack_type: str,
+    poison_rate: float,
+    target_label: int,
+    source_label: int = 1,
+    trigger_size: int = 3,
+    trigger_value: float = 1.0,
+    seed: int = 42,
+) -> Tuple[DataLoader, dict]:
+    """
+    Wrap an existing client train loader with poisoning logic and return:
+      (poisoned_loader, stats)
+    """
+    poisoned_dataset = PoisonedClientTrainDataset(
+        base_dataset=train_loader.dataset,
+        dataset_name=dataset_name,
+        attack_type=attack_type,
+        poison_rate=poison_rate,
+        target_label=target_label,
+        source_label=source_label,
+        trigger_size=trigger_size,
+        trigger_value=trigger_value,
+        seed=seed,
+    )
+
+    poisoned_loader = DataLoader(
+        poisoned_dataset,
+        batch_size=train_loader.batch_size,
+        shuffle=True,
+        num_workers=train_loader.num_workers,
+        drop_last=train_loader.drop_last,
+        pin_memory=train_loader.pin_memory,
+    )
+
+    stats = {
+        "attack_type": attack_type,
+        "num_samples": len(poisoned_dataset),
+        "num_eligible": poisoned_dataset.num_eligible,
+        "num_poisoned": poisoned_dataset.num_poisoned,
+        "poison_rate_effective": (
+            poisoned_dataset.num_poisoned / poisoned_dataset.num_eligible
+            if poisoned_dataset.num_eligible > 0 else 0.0
+        ),
+    }
+    return poisoned_loader, stats
+
+
 # ─────────────────────────────────────────────
 # Dirichlet Non-IID Partitioning
 # ─────────────────────────────────────────────
