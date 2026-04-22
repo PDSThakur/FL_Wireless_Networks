@@ -106,9 +106,26 @@ class MetricsTracker:
 
     def record(self, round_num: int, **metrics):
         """Record metrics for a given round."""
+        # Keep metric columns aligned even when some keys appear only in later rounds.
+        row_idx = len(self.history["round"])
         self.history["round"].append(round_num)
+
+        # Add a default value for this round to all previously seen metric columns.
+        for key in list(self.history.keys()):
+            if key == "round":
+                continue
+            # Heal any historical mismatch before appending.
+            if len(self.history[key]) < row_idx:
+                self.history[key].extend([np.nan] * (row_idx - len(self.history[key])))
+            self.history[key].append(np.nan)
+
+        # Fill this round's values.
         for key, value in metrics.items():
-            self.history[key].append(value)
+            if key not in self.history:
+                # Metric introduced mid-run: backfill previous rounds.
+                self.history[key] = [np.nan] * row_idx + [value]
+            else:
+                self.history[key][row_idx] = value
 
     def get_convergence_round(self, threshold: float = 0.80) -> Optional[int]:
         """
@@ -131,9 +148,10 @@ class MetricsTracker:
         with open(path, "w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=keys)
             writer.writeheader()
-            num_rows = len(self.history[keys[0]])
+            # Use number of logged rounds as canonical row count.
+            num_rows = len(self.history.get("round", []))
             for i in range(num_rows):
-                row = {k: self.history[k][i] for k in keys}
+                row = {k: (self.history[k][i] if i < len(self.history[k]) else "") for k in keys}
                 writer.writerow(row)
         print(f"  Saved metrics → {path}")
 
