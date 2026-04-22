@@ -99,6 +99,12 @@ def run_experiment(
     attack_type: str = "none",
     malicious_frac: float = 0.0,
     poison_rate: float = 0.0,
+    defense_enabled: bool = False,
+    defense_max_samples: int = 64,
+    defense_pca_components: int = 5,
+    defense_grad_steps: int = 3,
+    defense_grad_step_size: float = 0.01,
+    defense_mad_threshold: float = 2.5,
     seed: int           = 42,
     results_dir: str    = "../results",
 ) -> dict:
@@ -118,6 +124,12 @@ def run_experiment(
     print(f"  Clients:    {num_clients}  |  Rounds: {num_rounds}")
     print(f"  Alpha:      {alpha_str}")
     print(f"  Server:     {server_device}  |  Client: {client_device} (Ray num_gpus={client_num_gpus})")
+    if defense_enabled:
+        print(
+            "  Defense:    DifFense(DiffTest+TwoStepMAD) "
+            f"| samples={defense_max_samples} pca={defense_pca_components} "
+            f"steps={defense_grad_steps} lr={defense_grad_step_size} th={defense_mad_threshold}"
+        )
     print(f"{'='*60}")
 
     # ── Data Preparation ──────────────────────
@@ -247,6 +259,12 @@ def run_experiment(
         num_clients       = num_clients,
         pixel_backdoor_loader = pixel_backdoor_loader,
         semantic_backdoor_loader = semantic_backdoor_loader,
+        defense_enabled = defense_enabled,
+        defense_max_samples = defense_max_samples,
+        defense_pca_components = defense_pca_components,
+        defense_grad_steps = defense_grad_steps,
+        defense_grad_step_size = defense_grad_step_size,
+        defense_mad_threshold = defense_mad_threshold,
         fraction_fit      = fraction_fit,
         fraction_evaluate = 1.0,
         min_fit_clients   = max(2, int(fraction_fit * num_clients)),
@@ -296,6 +314,12 @@ def run_experiment(
         "poison_rate": poison_rate,
         "num_malicious_clients": len(malicious_client_ids),
         "malicious_client_ids": ",".join(str(x) for x in malicious_client_ids),
+        "defense_enabled": int(defense_enabled),
+        "defense_max_samples": defense_max_samples,
+        "defense_pca_components": defense_pca_components,
+        "defense_grad_steps": defense_grad_steps,
+        "defense_grad_step_size": defense_grad_step_size,
+        "defense_mad_threshold": defense_mad_threshold,
     })
 
     return summary
@@ -315,6 +339,12 @@ def run_all_experiments(
     attack_type: str = "none",
     malicious_frac: float = 0.0,
     poison_rate: float = 0.0,
+    defense_enabled: bool = False,
+    defense_max_samples: int = 64,
+    defense_pca_components: int = 5,
+    defense_grad_steps: int = 3,
+    defense_grad_step_size: float = 0.01,
+    defense_mad_threshold: float = 2.5,
 ):
     """
     Run all configurations required by the course:
@@ -353,6 +383,12 @@ def run_all_experiments(
                     attack_type = attack_type,
                     malicious_frac = malicious_frac,
                     poison_rate = poison_rate,
+                    defense_enabled = defense_enabled,
+                    defense_max_samples = defense_max_samples,
+                    defense_pca_components = defense_pca_components,
+                    defense_grad_steps = defense_grad_steps,
+                    defense_grad_step_size = defense_grad_step_size,
+                    defense_mad_threshold = defense_mad_threshold,
                     results_dir = results_dir,
                 )
                 all_results.append(result)
@@ -429,6 +465,18 @@ def parse_args():
                         help="Fraction of clients acting as attackers")
     parser.add_argument("--poison_rate", type=float, default=0.0,
                         help="Fraction of eligible local samples poisoned on each malicious client")
+    parser.add_argument("--defense_enabled", action="store_true",
+                        help="Enable DifFense-style filtering (Differential Testing + Two-Step MAD)")
+    parser.add_argument("--defense_max_samples", type=int, default=64,
+                        help="Number of server images used for differential testing")
+    parser.add_argument("--defense_pca_components", type=int, default=5,
+                        help="PCA components for model-behavior embeddings")
+    parser.add_argument("--defense_grad_steps", type=int, default=3,
+                        help="Gradient ascent steps to generate differential inputs")
+    parser.add_argument("--defense_grad_step_size", type=float, default=0.01,
+                        help="Step size for differential-input gradient ascent")
+    parser.add_argument("--defense_mad_threshold", type=float, default=2.5,
+                        help="Threshold on two-step MAD normalized deviation")
     parser.add_argument("--seed",        type=int,   default=42,
                         help="Random seed (course requires 42)")
     parser.add_argument("--results_dir", type=str,   default="../results",
@@ -455,6 +503,12 @@ if __name__ == "__main__":
             attack_type=args.attack_type,
             malicious_frac=args.malicious_frac,
             poison_rate=args.poison_rate,
+            defense_enabled=args.defense_enabled,
+            defense_max_samples=args.defense_max_samples,
+            defense_pca_components=args.defense_pca_components,
+            defense_grad_steps=args.defense_grad_steps,
+            defense_grad_step_size=args.defense_grad_step_size,
+            defense_mad_threshold=args.defense_mad_threshold,
         )
     else:
         # Parse alpha
@@ -479,6 +533,12 @@ if __name__ == "__main__":
             attack_type = args.attack_type,
             malicious_frac = args.malicious_frac,
             poison_rate = args.poison_rate,
+            defense_enabled = args.defense_enabled,
+            defense_max_samples = args.defense_max_samples,
+            defense_pca_components = args.defense_pca_components,
+            defense_grad_steps = args.defense_grad_steps,
+            defense_grad_step_size = args.defense_grad_step_size,
+            defense_mad_threshold = args.defense_mad_threshold,
             seed         = args.seed,
             results_dir  = args.results_dir,
         )
