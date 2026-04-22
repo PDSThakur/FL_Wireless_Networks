@@ -65,14 +65,18 @@ class FedAvgWithEval(FedAvg):
         tracker: MetricsTracker,
         dataset: str,
         device: torch.device,
+        pixel_backdoor_loader=None,
+        semantic_backdoor_loader=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
-        self.test_loader = test_loader
-        self.tracker     = tracker
-        self.dataset     = dataset
-        self.device      = device
-        self.model       = get_model(dataset).to(device)
+        self.test_loader             = test_loader
+        self.pixel_backdoor_loader   = pixel_backdoor_loader
+        self.semantic_backdoor_loader = semantic_backdoor_loader
+        self.tracker                 = tracker
+        self.dataset                 = dataset
+        self.device                  = device
+        self.model                   = get_model(dataset).to(device)
 
     def aggregate_fit(
         self,
@@ -104,21 +108,42 @@ class FedAvgWithEval(FedAvg):
         # Evaluate on test set
         loss, acc = evaluate(self.model, self.test_loader, self.device)
 
+        metrics = {
+            "global_accuracy": acc,
+            "global_loss": loss,
+        }
+
+        if self.pixel_backdoor_loader is not None:
+            pixel_loss, pixel_asr = evaluate(self.model, self.pixel_backdoor_loader, self.device)
+            metrics["pixel_backdoor_loss"] = pixel_loss
+            metrics["pixel_backdoor_accuracy"] = pixel_asr
+
+        if self.semantic_backdoor_loader is not None:
+            semantic_loss, semantic_asr = evaluate(self.model, self.semantic_backdoor_loader, self.device)
+            metrics["semantic_backdoor_loss"] = semantic_loss
+            metrics["semantic_backdoor_accuracy"] = semantic_asr
+
         # Record metrics
-        self.tracker.record(
-            round_num       = server_round,
-            global_accuracy = acc,
-            global_loss     = loss,
-        )
+        self.tracker.record(round_num=server_round, **metrics)
 
         # Console logging
-        print(
+        log = (
             f"  [Round {server_round:3d}] "
             f"Loss: {loss:.4f} | "
             f"Accuracy: {acc*100:.2f}%"
         )
+        if "pixel_backdoor_accuracy" in metrics:
+            log += f" | Pixel ASR: {metrics['pixel_backdoor_accuracy']*100:.2f}%"
+        if "semantic_backdoor_accuracy" in metrics:
+            log += f" | Semantic ASR: {metrics['semantic_backdoor_accuracy']*100:.2f}%"
+        print(log)
 
-        return float(loss), {"accuracy": float(acc)}
+        return_metrics = {"accuracy": float(acc)}
+        if "pixel_backdoor_accuracy" in metrics:
+            return_metrics["pixel_backdoor_accuracy"] = float(metrics["pixel_backdoor_accuracy"])
+        if "semantic_backdoor_accuracy" in metrics:
+            return_metrics["semantic_backdoor_accuracy"] = float(metrics["semantic_backdoor_accuracy"])
+        return float(loss), return_metrics
 
 
 # ─────────────────────────────────────────────
@@ -130,6 +155,8 @@ def build_server_app(
     dataset: str,
     num_rounds: int,
     num_clients: int,
+    pixel_backdoor_loader=None,
+    semantic_backdoor_loader=None,
     fraction_fit: float     = 0.5,
     fraction_evaluate: float = 1.0,
     min_fit_clients: int    = 2,
@@ -144,6 +171,8 @@ def build_server_app(
         dataset          : Dataset name (for model initialization)
         num_rounds       : Total FL communication rounds
         num_clients      : Total number of clients
+        pixel_backdoor_loader: DataLoader for pixel trigger backdoor evaluation
+        semantic_backdoor_loader: DataLoader for semantic backdoor evaluation
         fraction_fit     : Fraction of clients selected per round (0.5 = 50%)
         fraction_evaluate: Fraction evaluated per round
         min_fit_clients  : Minimum clients required for a round to proceed
@@ -161,6 +190,8 @@ def build_server_app(
     # Build strategy
     strategy = FedAvgWithEval(
         test_loader             = test_loader,
+        pixel_backdoor_loader   = pixel_backdoor_loader,
+        semantic_backdoor_loader = semantic_backdoor_loader,
         tracker                 = tracker,
         dataset                 = dataset,
         device                  = device,

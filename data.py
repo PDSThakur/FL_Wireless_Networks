@@ -5,7 +5,7 @@ Supports: MNIST, FashionMNIST, CIFAR-10, CIFAR-100
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, transforms
 from typing import List, Tuple, Optional
 
@@ -52,6 +52,14 @@ TRANSFORMS = {
     ]),
 }
 
+NORM_STATS = {
+    "mnist": ((0.1307,), (0.3081,)),
+    "fashionmnist": ((0.2860,), (0.3530,)),
+    "fmnist": ((0.2860,), (0.3530,)),
+    "cifar10": ((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+    "cifar100": ((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+}
+
 
 # ─────────────────────────────────────────────
 # Load full dataset
@@ -76,6 +84,162 @@ def load_full_dataset(dataset: str, data_dir: str = "./data"):
         raise ValueError(f"Unknown dataset: {dataset}")
 
     return train, test
+
+
+def _dataset_labels(dataset) -> np.ndarray:
+    """Return labels as a numpy array for datasets exposing `.targets`."""
+    if hasattr(dataset, "targets"):
+        return np.array(dataset.targets)
+    return np.array([dataset[i][1] for i in range(len(dataset))])
+
+
+def _normalized_trigger_values(dataset_name: str, trigger_value: float) -> torch.Tensor:
+    """
+    Convert a raw pixel value (0..1) to the normalized space used by each dataset.
+    """
+    dataset_name = dataset_name.lower()
+    if dataset_name not in NORM_STATS:
+        raise ValueError(f"Unsupported dataset for trigger normalization: {dataset_name}")
+    means, stds = NORM_STATS[dataset_name]
+    values = [(trigger_value - m) / s for m, s in zip(means, stds)]
+    return torch.tensor(values, dtype=torch.float32)
+
+
+def _apply_pixel_trigger(
+    image: torch.Tensor,
+    trigger_values: torch.Tensor,
+    trigger_size: int,
+) -> torch.Tensor:
+    """Apply a square pixel trigger in the bottom-right corner."""
+    poisoned = image.clone()
+    if poisoned.dim() != 3:
+        raise ValueError(f"Expected image shape [C,H,W], got {tuple(poisoned.shape)}")
+
+    channels, height, width = poisoned.shape
+    size = max(1, min(trigger_size, height, width))
+    h_start = height - size
+    w_start = width - size
+
+    if trigger_values.numel() == 1 and channels > 1:
+        trigger_values = trigger_values.repeat(channels)
+    if trigger_values.numel() != channels:
+        raise ValueError(
+            f"Trigger channel mismatch: image has {channels} channels but trigger has {trigger_values.numel()} values"
+        )
+
+    trigger_values = trigger_values.to(poisoned.dtype).to(poisoned.device)
+    for c in range(channels):
+        poisoned[c, h_start:, w_start:] = trigger_values[c]
+    return poisoned
+
+
+class PixelPatternBackdoorDataset(Dataset):
+    """
+    Test-time dataset for pixel-pattern backdoor evaluation.
+
+    Each sample receives a trigger patch and label is forced to `target_label`.
+    """
+
+    def __init__(
+        self,
+        base_dataset,
+        dataset_name: str,
+        target_label: int,
+        trigger_size: int = 3,
+        trigger_value: float = 1.0,
+        include_target_class: bool = False,
+    ):
+        self.base_dataset = base_dataset
+        self.dataset_name = dataset_name.lower()
+        self.target_label = int(target_label)
+        self.trigger_size = int(trigger_size)
+        self.trigger_values = _normalized_trigger_values(self.dataset_name, trigger_value)
+        self.include_target_class = include_target_class
+
+        labels = _dataset_labels(base_dataset)
+        if self.include_target_class:
+            self.indices = list(range(len(base_dataset)))
+        else:
+            self.indices = np.where(labels != self.target_label)[0].tolist()
+            if len(self.indices) == 0:
+                raise ValueError(
+                    f"No non-target samples available for pixel ASR with target_label={self.target_label}"
+                )
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        image, _ = self.base_dataset[self.indices[idx]]
+        poisoned = _apply_pixel_trigger(image, self.trigger_values, self.trigger_size)
+        return poisoned, self.target_label
+
+
+class SemanticBackdoorDataset(Dataset):
+    """
+    Test-time dataset for semantic backdoor evaluation.
+
+    Uses only source-class samples and changes labels to `target_label`.
+    """
+
+    def __init__(
+        self,
+        base_dataset,
+        source_label: int,
+        target_label: int,
+    ):
+        self.base_dataset = base_dataset
+        self.source_label = int(source_label)
+        self.target_label = int(target_label)
+
+        labels = _dataset_labels(base_dataset)
+        self.indices = np.where(labels == self.source_label)[0].tolist()
+        if len(self.indices) == 0:
+            raise ValueError(
+                f"No samples found for semantic source_label={self.source_label}"
+            )
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        image, _ = self.base_dataset[self.indices[idx]]
+        return image, self.target_label
+
+
+def get_backdoor_test_loaders(
+    test_dataset,
+    dataset_name: str,
+    batch_size: int = 128,
+    pixel_target_label: int = 0,
+    pixel_trigger_size: int = 3,
+    pixel_trigger_value: float = 1.0,
+    semantic_source_label: int = 1,
+    semantic_target_label: int = 0,
+) -> Tuple[DataLoader, DataLoader]:
+    """
+    Build backdoor test loaders for:
+    1) pixel-pattern backdoor attack
+    2) semantic source-class-to-target attack
+    """
+    pixel_dataset = PixelPatternBackdoorDataset(
+        base_dataset=test_dataset,
+        dataset_name=dataset_name,
+        target_label=pixel_target_label,
+        trigger_size=pixel_trigger_size,
+        trigger_value=pixel_trigger_value,
+        include_target_class=False,
+    )
+
+    semantic_dataset = SemanticBackdoorDataset(
+        base_dataset=test_dataset,
+        source_label=semantic_source_label,
+        target_label=semantic_target_label,
+    )
+
+    pixel_loader = DataLoader(pixel_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    semantic_loader = DataLoader(semantic_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    return pixel_loader, semantic_loader
 
 
 # ─────────────────────────────────────────────
