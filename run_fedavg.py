@@ -22,7 +22,14 @@ from flwr.simulation import run_simulation
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from model  import get_model
-from data   import load_full_dataset, get_partition, get_client_dataloader, get_test_dataloader, partition_stats
+from data   import (
+    load_full_dataset,
+    get_partition,
+    get_client_dataloader,
+    get_test_dataloader,
+    get_backdoor_test_loaders,
+    partition_stats,
+)
 from utils  import MetricsTracker, compute_comm_cost_mb, plot_accuracy_vs_rounds, plot_loss_vs_rounds, plot_iid_vs_noniid, print_results_table
 from client import build_client_app
 from server import build_server_app
@@ -41,6 +48,20 @@ def set_seeds(seed: int = 42):
     torch.backends.cudnn.benchmark     = False
 
 
+def resolve_devices(client_num_gpus: float) -> tuple[torch.device, torch.device]:
+    """Resolve server/client devices based on CUDA availability and Ray resources."""
+    has_cuda = torch.cuda.is_available()
+    server_device = torch.device("cuda" if has_cuda else "cpu")
+    client_device = torch.device("cuda" if has_cuda and client_num_gpus > 0.0 else "cpu")
+
+    if client_num_gpus > 0.0 and not has_cuda:
+        print("  [Device] Clients requested GPU resources, but CUDA is unavailable. Using CPU.")
+    elif client_num_gpus == 0.0 and has_cuda:
+        print("  [Device] Ray clients configured with num_gpus=0.0. Using CPU for clients.")
+
+    return server_device, client_device
+
+
 # ─────────────────────────────────────────────
 # Single Experiment
 # ─────────────────────────────────────────────
@@ -54,6 +75,12 @@ def run_experiment(
     learning_rate: float = 0.01,
     momentum: float     = 0.9,
     fraction_fit: float = 0.5,
+    client_num_gpus: float = 0.0,
+    backdoor_target_label: int = 0,
+    semantic_source_label: int = 1,
+    pixel_trigger_size: int = 3,
+    pixel_trigger_value: float = 1.0,
+    disable_backdoor_eval: bool = False,
     seed: int           = 42,
     results_dir: str    = "../results",
 ) -> dict:
@@ -62,7 +89,7 @@ def run_experiment(
     Returns a summary dict of final metrics.
     """
     set_seeds(seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    server_device, client_device = resolve_devices(client_num_gpus)
 
     alpha_str = str(alpha)
     exp_name  = f"fedavg_{dataset}_c{num_clients}_r{num_rounds}_a{alpha_str}"
@@ -71,7 +98,8 @@ def run_experiment(
     print(f"  Experiment: {exp_name}")
     print(f"  Dataset:    {dataset.upper()}")
     print(f"  Clients:    {num_clients}  |  Rounds: {num_rounds}")
-    print(f"  Alpha:      {alpha_str}  |  Device: {device}")
+    print(f"  Alpha:      {alpha_str}")
+    print(f"  Server:     {server_device}  |  Client: {client_device} (Ray num_gpus={client_num_gpus})")
     print(f"{'='*60}")
 
     # ── Data Preparation ──────────────────────
@@ -91,6 +119,41 @@ def run_experiment(
 
     test_loader = get_test_dataloader(test_dataset, batch_size=128)
 
+    pixel_backdoor_loader = None
+    semantic_backdoor_loader = None
+    effective_semantic_source_label = semantic_source_label
+    if not disable_backdoor_eval:
+        labels = np.array(test_dataset.targets) if hasattr(test_dataset, "targets") else np.array([test_dataset[i][1] for i in range(len(test_dataset))])
+        num_classes = len(np.unique(labels))
+        if not (0 <= backdoor_target_label < num_classes):
+            raise ValueError(f"backdoor_target_label={backdoor_target_label} is out of range [0, {num_classes - 1}]")
+        if not (0 <= semantic_source_label < num_classes):
+            raise ValueError(f"semantic_source_label={semantic_source_label} is out of range [0, {num_classes - 1}]")
+
+        semantic_source = semantic_source_label
+        if semantic_source == backdoor_target_label:
+            semantic_source = (backdoor_target_label + 1) % num_classes
+            print(
+                f"  [Backdoor] semantic_source_label matched target ({backdoor_target_label}); "
+                f"using source={semantic_source} instead."
+            )
+        effective_semantic_source_label = semantic_source
+
+        pixel_backdoor_loader, semantic_backdoor_loader = get_backdoor_test_loaders(
+            test_dataset=test_dataset,
+            dataset_name=dataset,
+            batch_size=128,
+            pixel_target_label=backdoor_target_label,
+            pixel_trigger_size=pixel_trigger_size,
+            pixel_trigger_value=pixel_trigger_value,
+            semantic_source_label=semantic_source,
+            semantic_target_label=backdoor_target_label,
+        )
+        print(
+            f"  [Backdoor] Pixel eval samples: {len(pixel_backdoor_loader.dataset)} | "
+            f"Semantic eval samples: {len(semantic_backdoor_loader.dataset)}"
+        )
+
     # ── Metrics Tracker ───────────────────────
     os.makedirs(results_dir, exist_ok=True)
     tracker = MetricsTracker(save_dir=results_dir, experiment_name=exp_name)
@@ -105,7 +168,7 @@ def run_experiment(
         local_epochs  = local_epochs,
         learning_rate = learning_rate,
         momentum      = momentum,
-        device        = device,
+        device        = client_device,
     )
 
     server_app = build_server_app(
@@ -114,10 +177,12 @@ def run_experiment(
         dataset           = dataset,
         num_rounds        = num_rounds,
         num_clients       = num_clients,
+        pixel_backdoor_loader = pixel_backdoor_loader,
+        semantic_backdoor_loader = semantic_backdoor_loader,
         fraction_fit      = fraction_fit,
         fraction_evaluate = 1.0,
         min_fit_clients   = max(2, int(fraction_fit * num_clients)),
-        device            = device,
+        device            = server_device,
     )
 
     # ── Run Simulation ────────────────────────
@@ -128,7 +193,7 @@ def run_experiment(
         server_app  = server_app,
         client_app  = client_app,
         num_supernodes = num_clients,
-        backend_config = {"client_resources": {"num_cpus": 1, "num_gpus": 0.0}},
+        backend_config = {"client_resources": {"num_cpus": 1, "num_gpus": client_num_gpus}},
     )
 
     elapsed = time.time() - start_time
@@ -154,6 +219,10 @@ def run_experiment(
         "num_rounds":  num_rounds,
         "alpha":       alpha_str,
         "comm_mb":     f"{comm_mb:.1f}",
+        "client_num_gpus": client_num_gpus,
+        "backdoor_target_label": backdoor_target_label,
+        "semantic_source_label": effective_semantic_source_label,
+        "pixel_trigger_size": pixel_trigger_size,
     })
 
     return summary
@@ -162,7 +231,15 @@ def run_experiment(
 # ─────────────────────────────────────────────
 # Run ALL required configurations
 # ─────────────────────────────────────────────
-def run_all_experiments(results_dir: str = "../results"):
+def run_all_experiments(
+    results_dir: str = "../results",
+    client_num_gpus: float = 0.0,
+    backdoor_target_label: int = 0,
+    semantic_source_label: int = 1,
+    pixel_trigger_size: int = 3,
+    pixel_trigger_value: float = 1.0,
+    disable_backdoor_eval: bool = False,
+):
     """
     Run all configurations required by the course:
     - Datasets: MNIST, FashionMNIST, CIFAR-10
@@ -191,6 +268,12 @@ def run_all_experiments(results_dir: str = "../results"):
                     num_clients = num_clients,
                     num_rounds  = ROUNDS[dataset],
                     alpha       = alpha,
+                    client_num_gpus = client_num_gpus,
+                    backdoor_target_label = backdoor_target_label,
+                    semantic_source_label = semantic_source_label,
+                    pixel_trigger_size = pixel_trigger_size,
+                    pixel_trigger_value = pixel_trigger_value,
+                    disable_backdoor_eval = disable_backdoor_eval,
                     results_dir = results_dir,
                 )
                 all_results.append(result)
@@ -248,6 +331,18 @@ def parse_args():
                         help="SGD momentum (course requires 0.9)")
     parser.add_argument("--fraction_fit",type=float, default=0.5,
                         help="Fraction of clients per round (course requires 0.5)")
+    parser.add_argument("--client_num_gpus", type=float, default=0.0,
+                        help="GPU resources per Ray client worker (set >0 to enable client-side CUDA)")
+    parser.add_argument("--backdoor_target_label", type=int, default=0,
+                        help="Target label used to compute backdoor attack success rate (ASR)")
+    parser.add_argument("--semantic_source_label", type=int, default=1,
+                        help="Source class used for semantic backdoor ASR evaluation")
+    parser.add_argument("--pixel_trigger_size", type=int, default=3,
+                        help="Square trigger size (in pixels) for pixel-pattern backdoor evaluation")
+    parser.add_argument("--pixel_trigger_value", type=float, default=1.0,
+                        help="Raw trigger pixel value before normalization (0..1)")
+    parser.add_argument("--disable_backdoor_eval", action="store_true",
+                        help="Disable per-round pixel/semantic backdoor evaluation")
     parser.add_argument("--seed",        type=int,   default=42,
                         help="Random seed (course requires 42)")
     parser.add_argument("--results_dir", type=str,   default="../results",
@@ -263,7 +358,15 @@ if __name__ == "__main__":
 
     if args.run_all:
         print("\n Running ALL required experimental configurations...\n")
-        run_all_experiments(results_dir=args.results_dir)
+        run_all_experiments(
+            results_dir=args.results_dir,
+            client_num_gpus=args.client_num_gpus,
+            backdoor_target_label=args.backdoor_target_label,
+            semantic_source_label=args.semantic_source_label,
+            pixel_trigger_size=args.pixel_trigger_size,
+            pixel_trigger_value=args.pixel_trigger_value,
+            disable_backdoor_eval=args.disable_backdoor_eval,
+        )
     else:
         # Parse alpha
         alpha = args.alpha if args.alpha.lower() == "iid" else float(args.alpha)
@@ -278,6 +381,12 @@ if __name__ == "__main__":
             learning_rate= args.lr,
             momentum     = args.momentum,
             fraction_fit = args.fraction_fit,
+            client_num_gpus = args.client_num_gpus,
+            backdoor_target_label = args.backdoor_target_label,
+            semantic_source_label = args.semantic_source_label,
+            pixel_trigger_size = args.pixel_trigger_size,
+            pixel_trigger_value = args.pixel_trigger_value,
+            disable_backdoor_eval = args.disable_backdoor_eval,
             seed         = args.seed,
             results_dir  = args.results_dir,
         )

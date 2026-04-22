@@ -17,6 +17,21 @@ from data  import load_full_dataset, get_partition, get_client_dataloader
 from utils import train, evaluate
 
 
+_CUDA_FALLBACK_WARNED = False
+
+
+def _resolve_device(device: torch.device) -> torch.device:
+    """Fallback to CPU if CUDA is requested but unavailable in this worker."""
+    global _CUDA_FALLBACK_WARNED
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and not torch.cuda.is_available():
+        if not _CUDA_FALLBACK_WARNED:
+            print("  [Client] CUDA requested, but unavailable in this Ray worker. Falling back to CPU.")
+            _CUDA_FALLBACK_WARNED = True
+        return torch.device("cpu")
+    return resolved
+
+
 # ─────────────────────────────────────────────
 # Flower NumPy Client
 # ─────────────────────────────────────────────
@@ -48,8 +63,8 @@ class FedAvgClient(NumPyClient):
         self.local_epochs = local_epochs
         self.lr           = learning_rate
         self.momentum     = momentum
-        self.device       = device
-        self.model        = get_model(dataset).to(device)
+        self.device       = _resolve_device(device)
+        self.model        = get_model(dataset).to(self.device)
 
     # ── Flower interface ──────────────────────
 

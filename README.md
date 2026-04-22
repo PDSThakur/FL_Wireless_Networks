@@ -87,3 +87,20 @@ Results are saved to `results/`:
 - `fedavg_{dataset}_c{clients}_r{rounds}_a{alpha}.csv` — per-round metrics
 - `figure4_iid_noniid_{dataset}_c{clients}.png` — IID vs Non-IID plots
 - `fedavg_all_results.csv` — combined summary table
+
+---
+
+## Backdoor Evaluation
+
+You can report backdoor accuracy (ASR) for both attack types per round:
+- Pixel-pattern backdoor (`pixel_backdoor_accuracy`)
+- Semantic backdoor (`semantic_backdoor_accuracy`)
+
+Example:
+```bash
+python run_fedavg.py --dataset cifar10 --num_clients 10 --num_rounds 100 --alpha 0.5 --backdoor_target_label 0 --semantic_source_label 1 --pixel_trigger_size 3
+```
+
+Optional flags:
+- `--pixel_trigger_value` (default `1.0`)
+- `--disable_backdoor_eval` (disable backdoor metrics)

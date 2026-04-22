@@ -141,12 +141,19 @@ class MetricsTracker:
         """Return a summary dict of final metrics."""
         accs = self.history.get("global_accuracy", [0])
         losses = self.history.get("global_loss", [0])
-        return {
+        out = {
             "final_accuracy": accs[-1] if accs else 0,
             "final_loss":     losses[-1] if losses else 0,
             "convergence_round": self.get_convergence_round(),
             "total_rounds":   len(self.history.get("round", [])),
         }
+        pixel_accs = self.history.get("pixel_backdoor_accuracy", [])
+        semantic_accs = self.history.get("semantic_backdoor_accuracy", [])
+        if pixel_accs:
+            out["final_pixel_backdoor_accuracy"] = pixel_accs[-1]
+        if semantic_accs:
+            out["final_semantic_backdoor_accuracy"] = semantic_accs[-1]
+        return out
 
 
 # ─────────────────────────────────────────────
