@@ -153,6 +153,10 @@ class MetricsTracker:
             out["final_pixel_backdoor_accuracy"] = pixel_accs[-1]
         if semantic_accs:
             out["final_semantic_backdoor_accuracy"] = semantic_accs[-1]
+        defense_flags = self.history.get("defense_flagged_clients", [])
+        if defense_flags:
+            out["final_defense_flagged_clients"] = defense_flags[-1]
+            out["avg_defense_flagged_clients"] = float(np.mean(defense_flags))
         return out
 
 
