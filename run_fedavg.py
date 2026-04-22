@@ -105,6 +105,7 @@ def run_experiment(
     defense_grad_steps: int = 3,
     defense_grad_step_size: float = 0.01,
     defense_mad_threshold: float = 2.5,
+    min_fit_clients: int = 2,
     seed: int           = 42,
     results_dir: str    = "../results",
 ) -> dict:
@@ -128,7 +129,8 @@ def run_experiment(
         print(
             "  Defense:    DifFense(DiffTest+TwoStepMAD) "
             f"| samples={defense_max_samples} pca={defense_pca_components} "
-            f"steps={defense_grad_steps} lr={defense_grad_step_size} th={defense_mad_threshold}"
+            f"steps={defense_grad_steps} lr={defense_grad_step_size} th={defense_mad_threshold} "
+            f"| min_fit_clients={max(2, min(int(min_fit_clients), num_clients))}"
         )
     print(f"{'='*60}")
 
@@ -267,7 +269,7 @@ def run_experiment(
         defense_mad_threshold = defense_mad_threshold,
         fraction_fit      = fraction_fit,
         fraction_evaluate = 1.0,
-        min_fit_clients   = max(2, int(fraction_fit * num_clients)),
+        min_fit_clients   = max(2, min(int(min_fit_clients), num_clients)),
         device            = server_device,
     )
 
@@ -320,6 +322,7 @@ def run_experiment(
         "defense_grad_steps": defense_grad_steps,
         "defense_grad_step_size": defense_grad_step_size,
         "defense_mad_threshold": defense_mad_threshold,
+        "min_fit_clients": max(2, min(int(min_fit_clients), num_clients)),
     })
 
     return summary
@@ -345,6 +348,7 @@ def run_all_experiments(
     defense_grad_steps: int = 3,
     defense_grad_step_size: float = 0.01,
     defense_mad_threshold: float = 2.5,
+    min_fit_clients: int = 2,
 ):
     """
     Run all configurations required by the course:
@@ -389,6 +393,7 @@ def run_all_experiments(
                     defense_grad_steps = defense_grad_steps,
                     defense_grad_step_size = defense_grad_step_size,
                     defense_mad_threshold = defense_mad_threshold,
+                    min_fit_clients = min_fit_clients,
                     results_dir = results_dir,
                 )
                 all_results.append(result)
@@ -477,6 +482,8 @@ def parse_args():
                         help="Step size for differential-input gradient ascent")
     parser.add_argument("--defense_mad_threshold", type=float, default=2.5,
                         help="Threshold on two-step MAD normalized deviation")
+    parser.add_argument("--min_fit_clients", type=int, default=2,
+                        help="Minimum number of client updates required to aggregate each round")
     parser.add_argument("--seed",        type=int,   default=42,
                         help="Random seed (course requires 42)")
     parser.add_argument("--results_dir", type=str,   default="../results",
@@ -509,6 +516,7 @@ if __name__ == "__main__":
             defense_grad_steps=args.defense_grad_steps,
             defense_grad_step_size=args.defense_grad_step_size,
             defense_mad_threshold=args.defense_mad_threshold,
+            min_fit_clients=args.min_fit_clients,
         )
     else:
         # Parse alpha
@@ -539,6 +547,7 @@ if __name__ == "__main__":
             defense_grad_steps = args.defense_grad_steps,
             defense_grad_step_size = args.defense_grad_step_size,
             defense_mad_threshold = args.defense_mad_threshold,
+            min_fit_clients = args.min_fit_clients,
             seed         = args.seed,
             results_dir  = args.results_dir,
         )

@@ -9,7 +9,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import torch
 import flwr as fl
-from flwr.client import NumPyClient, ClientApp
+from flwr.client import Client, NumPyClient, ClientApp
 from flwr.common import Context
 
 from model import get_model
@@ -149,11 +149,11 @@ def make_client_fn(
     Each client is identified by a partition_id (= client index).
     """
 
-    def client_fn(context: Context) -> NumPyClient:
+    def client_fn(context: Context) -> Client:
         # Flower passes partition_id via context
         partition_id = int(context.node_config["partition-id"])
 
-        return FedAvgClient(
+        numpy_client = FedAvgClient(
             client_id    = partition_id,
             train_loader = train_loaders[partition_id],
             val_loader   = val_loaders[partition_id],
@@ -163,6 +163,7 @@ def make_client_fn(
             momentum     = momentum,
             device       = device,
         )
+        return numpy_client.to_client()
 
     return client_fn
 
