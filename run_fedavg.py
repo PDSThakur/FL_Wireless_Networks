@@ -12,6 +12,7 @@ import os
 import random
 import sys
 import time
+from typing import List
 
 import numpy as np
 import torch
@@ -28,6 +29,7 @@ from data   import (
     get_client_dataloader,
     get_test_dataloader,
     get_backdoor_test_loaders,
+    build_poisoned_client_train_loader,
     partition_stats,
 )
 from utils  import MetricsTracker, compute_comm_cost_mb, plot_accuracy_vs_rounds, plot_loss_vs_rounds, plot_iid_vs_noniid, print_results_table
@@ -62,6 +64,19 @@ def resolve_devices(client_num_gpus: float) -> tuple[torch.device, torch.device]
     return server_device, client_device
 
 
+def select_malicious_client_ids(num_clients: int, malicious_frac: float, seed: int) -> List[int]:
+    """Select malicious client ids deterministically from [0, num_clients)."""
+    if malicious_frac <= 0.0:
+        return []
+    n = int(np.floor(malicious_frac * num_clients))
+    if n == 0:
+        n = 1
+    n = min(n, num_clients)
+    rng = np.random.RandomState(seed)
+    selected = rng.choice(np.arange(num_clients), size=n, replace=False).tolist()
+    return sorted(int(x) for x in selected)
+
+
 # ─────────────────────────────────────────────
 # Single Experiment
 # ─────────────────────────────────────────────
@@ -81,6 +96,9 @@ def run_experiment(
     pixel_trigger_size: int = 3,
     pixel_trigger_value: float = 1.0,
     disable_backdoor_eval: bool = False,
+    attack_type: str = "none",
+    malicious_frac: float = 0.0,
+    poison_rate: float = 0.0,
     seed: int           = 42,
     results_dir: str    = "../results",
 ) -> dict:
@@ -117,11 +135,61 @@ def run_experiment(
         train_loaders.append(get_client_dataloader(train_dataset, trn_idx, batch_size, shuffle=True))
         val_loaders.append(  get_client_dataloader(train_dataset, val_idx, batch_size, shuffle=False))
 
+    attack_type = attack_type.lower()
+    if attack_type not in ("none", "pixel", "semantic"):
+        raise ValueError(f"attack_type must be one of: none, pixel, semantic (got {attack_type})")
+    if not (0.0 <= malicious_frac <= 1.0):
+        raise ValueError(f"malicious_frac must be in [0,1], got {malicious_frac}")
+    if not (0.0 <= poison_rate <= 1.0):
+        raise ValueError(f"poison_rate must be in [0,1], got {poison_rate}")
+
+    train_labels = np.array(train_dataset.targets) if hasattr(train_dataset, "targets") else np.array([train_dataset[i][1] for i in range(len(train_dataset))])
+    train_num_classes = len(np.unique(train_labels))
+    semantic_source_for_attack = semantic_source_label
+    if attack_type == "semantic" and semantic_source_for_attack == backdoor_target_label:
+        semantic_source_for_attack = (backdoor_target_label + 1) % train_num_classes
+        print(
+            f"  [Attack] semantic_source_label matched target ({backdoor_target_label}); "
+            f"using source={semantic_source_for_attack} for training attack."
+        )
+
+    malicious_client_ids: List[int] = []
+    attack_stats = {}
+    if attack_type != "none" and malicious_frac > 0.0 and poison_rate > 0.0:
+        malicious_client_ids = select_malicious_client_ids(num_clients, malicious_frac, seed)
+        for cid in malicious_client_ids:
+            poisoned_loader, stats = build_poisoned_client_train_loader(
+                train_loader=train_loaders[cid],
+                dataset_name=dataset,
+                attack_type=attack_type,
+                poison_rate=poison_rate,
+                target_label=backdoor_target_label,
+                source_label=semantic_source_for_attack,
+                trigger_size=pixel_trigger_size,
+                trigger_value=pixel_trigger_value,
+                seed=seed + cid,
+            )
+            train_loaders[cid] = poisoned_loader
+            attack_stats[cid] = stats
+
+        total_poisoned = sum(s["num_poisoned"] for s in attack_stats.values())
+        total_eligible = sum(s["num_eligible"] for s in attack_stats.values())
+        print(
+            f"  [Attack] Type: {attack_type} | Malicious clients: {len(malicious_client_ids)}/{num_clients} "
+            f"({malicious_frac:.2f}) | Poisoned samples: {total_poisoned}/{total_eligible}"
+        )
+        print(f"  [Attack] Malicious client ids: {malicious_client_ids}")
+    elif attack_type != "none":
+        print(
+            "  [Attack] attack_type is set but no poisoning applied "
+            f"(malicious_frac={malicious_frac}, poison_rate={poison_rate})."
+        )
+
     test_loader = get_test_dataloader(test_dataset, batch_size=128)
 
     pixel_backdoor_loader = None
     semantic_backdoor_loader = None
-    effective_semantic_source_label = semantic_source_label
+    effective_semantic_source_label = semantic_source_for_attack
     if not disable_backdoor_eval:
         labels = np.array(test_dataset.targets) if hasattr(test_dataset, "targets") else np.array([test_dataset[i][1] for i in range(len(test_dataset))])
         num_classes = len(np.unique(labels))
@@ -223,6 +291,11 @@ def run_experiment(
         "backdoor_target_label": backdoor_target_label,
         "semantic_source_label": effective_semantic_source_label,
         "pixel_trigger_size": pixel_trigger_size,
+        "attack_type": attack_type,
+        "malicious_frac": malicious_frac,
+        "poison_rate": poison_rate,
+        "num_malicious_clients": len(malicious_client_ids),
+        "malicious_client_ids": ",".join(str(x) for x in malicious_client_ids),
     })
 
     return summary
@@ -239,6 +312,9 @@ def run_all_experiments(
     pixel_trigger_size: int = 3,
     pixel_trigger_value: float = 1.0,
     disable_backdoor_eval: bool = False,
+    attack_type: str = "none",
+    malicious_frac: float = 0.0,
+    poison_rate: float = 0.0,
 ):
     """
     Run all configurations required by the course:
@@ -274,6 +350,9 @@ def run_all_experiments(
                     pixel_trigger_size = pixel_trigger_size,
                     pixel_trigger_value = pixel_trigger_value,
                     disable_backdoor_eval = disable_backdoor_eval,
+                    attack_type = attack_type,
+                    malicious_frac = malicious_frac,
+                    poison_rate = poison_rate,
                     results_dir = results_dir,
                 )
                 all_results.append(result)
@@ -343,6 +422,13 @@ def parse_args():
                         help="Raw trigger pixel value before normalization (0..1)")
     parser.add_argument("--disable_backdoor_eval", action="store_true",
                         help="Disable per-round pixel/semantic backdoor evaluation")
+    parser.add_argument("--attack_type", type=str, default="none",
+                        choices=["none", "pixel", "semantic"],
+                        help="Training-time attacker type: none, pixel, or semantic")
+    parser.add_argument("--malicious_frac", type=float, default=0.0,
+                        help="Fraction of clients acting as attackers")
+    parser.add_argument("--poison_rate", type=float, default=0.0,
+                        help="Fraction of eligible local samples poisoned on each malicious client")
     parser.add_argument("--seed",        type=int,   default=42,
                         help="Random seed (course requires 42)")
     parser.add_argument("--results_dir", type=str,   default="../results",
@@ -366,6 +452,9 @@ if __name__ == "__main__":
             pixel_trigger_size=args.pixel_trigger_size,
             pixel_trigger_value=args.pixel_trigger_value,
             disable_backdoor_eval=args.disable_backdoor_eval,
+            attack_type=args.attack_type,
+            malicious_frac=args.malicious_frac,
+            poison_rate=args.poison_rate,
         )
     else:
         # Parse alpha
@@ -387,6 +476,9 @@ if __name__ == "__main__":
             pixel_trigger_size = args.pixel_trigger_size,
             pixel_trigger_value = args.pixel_trigger_value,
             disable_backdoor_eval = args.disable_backdoor_eval,
+            attack_type = args.attack_type,
+            malicious_frac = args.malicious_frac,
+            poison_rate = args.poison_rate,
             seed         = args.seed,
             results_dir  = args.results_dir,
         )

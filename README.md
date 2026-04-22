@@ -104,3 +104,17 @@ python run_fedavg.py --dataset cifar10 --num_clients 10 --num_rounds 100 --alpha
 Optional flags:
 - `--pixel_trigger_value` (default `1.0`)
 - `--disable_backdoor_eval` (disable backdoor metrics)
+
+## Attacker Clients
+
+Training-time attacker clients are now supported.
+
+Example (pixel attack):
+```bash
+python run_fedavg.py --dataset cifar10 --num_clients 10 --num_rounds 50 --alpha 0.5 --attack_type pixel --malicious_frac 0.2 --poison_rate 0.3 --backdoor_target_label 0 --pixel_trigger_size 3
+```
+
+Example (semantic attack):
+```bash
+python run_fedavg.py --dataset cifar10 --num_clients 10 --num_rounds 50 --alpha 0.5 --attack_type semantic --malicious_frac 0.2 --poison_rate 0.3 --backdoor_target_label 0 --semantic_source_label 1
+```
