@@ -123,11 +123,6 @@ class FedAvgWithEval(FedAvg):
 
         # Store flagged client IDs per round for FPR/FNR calculation
         self.defense_flagged_clients_per_round: list[list[str]] = []
-
-    def get_defense_flagged_clients_per_round(self):
-        """Return the list of flagged client IDs per round."""
-        return self.defense_flagged_clients_per_round
-
         self._last_defense_stats: Dict[str, Scalar] = {
             "defense_flagged_clients": 0,
             "defense_retained_clients": 0,
@@ -143,6 +138,10 @@ class FedAvgWithEval(FedAvg):
             "defense_detector_weight_lof": 0.25,
             "defense_detector_weight_ocsvm": 0.25,
         }
+
+    def get_defense_flagged_clients_per_round(self):
+        """Return the list of flagged client IDs per round."""
+        return self.defense_flagged_clients_per_round
 
     # ------------------------
     # Defense helper methods
@@ -808,7 +807,7 @@ class FedAvgWithEval(FedAvg):
             metrics["semantic_backdoor_loss"] = semantic_loss
             metrics["semantic_backdoor_accuracy"] = semantic_asr
 
-        metrics.update(self._last_defense_stats)
+        metrics.update(getattr(self, "_last_defense_stats", {}))
         self.tracker.record(round_num=server_round, **metrics)
 
         log = (
