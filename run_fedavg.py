@@ -114,6 +114,8 @@ def run_experiment(
     defense_bayes_blend: float = 0.6,
     defense_adaptive_threshold: bool = True,
     defense_cv_folds: int = 3,
+    defense_hard_filter: bool = False,
+    defense_flag_threshold: float = 0.5,
     min_fit_clients: int = 2,
     seed: int           = 42,
     results_dir: str    = "../results",
@@ -141,6 +143,7 @@ def run_experiment(
             f"steps={defense_grad_steps} lr={defense_grad_step_size} th={defense_mad_threshold} "
             f"| alpha={defense_temporal_alpha} prior={defense_bayes_prior} "
             f"| adaptive={int(defense_adaptive_threshold)} cv={defense_cv_folds} "
+            f"| hard_filter={int(defense_hard_filter)} flag_th={defense_flag_threshold:.2f} "
             f"| min_fit_clients={max(2, min(int(min_fit_clients), num_clients))}"
         )
     print(f"{'='*60}")
@@ -167,6 +170,8 @@ def run_experiment(
         raise ValueError(f"malicious_frac must be in [0,1], got {malicious_frac}")
     if not (0.0 <= poison_rate <= 1.0):
         raise ValueError(f"poison_rate must be in [0,1], got {poison_rate}")
+    if not (0.0 <= defense_flag_threshold <= 1.0):
+        raise ValueError(f"defense_flag_threshold must be in [0,1], got {defense_flag_threshold}")
 
     train_labels = np.array(train_dataset.targets) if hasattr(train_dataset, "targets") else np.array([train_dataset[i][1] for i in range(len(train_dataset))])
     train_num_classes = len(np.unique(train_labels))
@@ -287,6 +292,8 @@ def run_experiment(
         defense_bayes_blend = defense_bayes_blend,
         defense_adaptive_threshold = defense_adaptive_threshold,
         defense_cv_folds = defense_cv_folds,
+        defense_hard_filter = defense_hard_filter,
+        defense_flag_threshold = defense_flag_threshold,
         fraction_fit      = fraction_fit,
         fraction_evaluate = 1.0,
         min_fit_clients   = max(2, min(int(min_fit_clients), num_clients)),
@@ -374,6 +381,8 @@ def run_experiment(
         "defense_bayes_blend": defense_bayes_blend,
         "defense_adaptive_threshold": int(defense_adaptive_threshold),
         "defense_cv_folds": defense_cv_folds,
+        "defense_hard_filter": int(defense_hard_filter),
+        "defense_flag_threshold": defense_flag_threshold,
         "min_fit_clients": max(2, min(int(min_fit_clients), num_clients)),
         "mean_fpr": mean_fpr,
         "mean_fnr": mean_fnr,
@@ -411,6 +420,8 @@ def run_all_experiments(
     defense_bayes_blend: float = 0.6,
     defense_adaptive_threshold: bool = True,
     defense_cv_folds: int = 3,
+    defense_hard_filter: bool = False,
+    defense_flag_threshold: float = 0.5,
     min_fit_clients: int = 2,
 ):
     """
@@ -465,6 +476,8 @@ def run_all_experiments(
                     defense_bayes_blend = defense_bayes_blend,
                     defense_adaptive_threshold = defense_adaptive_threshold,
                     defense_cv_folds = defense_cv_folds,
+                    defense_hard_filter = defense_hard_filter,
+                    defense_flag_threshold = defense_flag_threshold,
                     min_fit_clients = min_fit_clients,
                     results_dir = results_dir,
                 )
@@ -572,6 +585,10 @@ def parse_args():
                         help="Disable adaptive valley-seeking thresholding and use fixed MAD threshold")
     parser.add_argument("--defense_cv_folds", type=int, default=3,
                         help="K-fold count for adaptive threshold model selection")
+    parser.add_argument("--defense_hard_filter", action="store_true",
+                        help="Drop clients from aggregation when malicious probability exceeds defense_flag_threshold")
+    parser.add_argument("--defense_flag_threshold", type=float, default=0.5,
+                        help="Malicious-probability threshold (0..1) used for soft-flagging and optional hard filtering")
     parser.add_argument("--min_fit_clients", type=int, default=2,
                         help="Minimum number of client updates required to aggregate each round")
     parser.add_argument("--seed",        type=int,   default=42,
@@ -615,6 +632,8 @@ if __name__ == "__main__":
             defense_bayes_blend=args.defense_bayes_blend,
             defense_adaptive_threshold=not args.defense_disable_adaptive_threshold,
             defense_cv_folds=args.defense_cv_folds,
+            defense_hard_filter=args.defense_hard_filter,
+            defense_flag_threshold=args.defense_flag_threshold,
             min_fit_clients=args.min_fit_clients,
         )
     else:
@@ -655,6 +674,8 @@ if __name__ == "__main__":
             defense_bayes_blend = args.defense_bayes_blend,
             defense_adaptive_threshold = not args.defense_disable_adaptive_threshold,
             defense_cv_folds = args.defense_cv_folds,
+            defense_hard_filter = args.defense_hard_filter,
+            defense_flag_threshold = args.defense_flag_threshold,
             min_fit_clients = args.min_fit_clients,
             seed         = args.seed,
             results_dir  = args.results_dir,

@@ -56,7 +56,8 @@ class FedAvgWithEval(FedAvg):
     4) temporal suspicion memory,
     5) ensemble outlier detection,
     6) Bayesian malicious-posterior estimation,
-    7) soft trust weighting in aggregation.
+    7) soft trust weighting in aggregation,
+    8) optional hard filtering of high-risk clients.
     """
 
     def __init__(
@@ -82,6 +83,8 @@ class FedAvgWithEval(FedAvg):
         defense_bayes_blend: float = 0.6,
         defense_adaptive_threshold: bool = True,
         defense_cv_folds: int = 3,
+        defense_hard_filter: bool = False,
+        defense_flag_threshold: float = 0.5,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -109,6 +112,8 @@ class FedAvgWithEval(FedAvg):
         self.defense_bayes_blend = float(np.clip(defense_bayes_blend, 0.0, 1.0))
         self.defense_adaptive_threshold = bool(defense_adaptive_threshold)
         self.defense_cv_folds = max(2, int(defense_cv_folds))
+        self.defense_hard_filter = bool(defense_hard_filter)
+        self.defense_flag_threshold = float(np.clip(defense_flag_threshold, 0.0, 1.0))
 
         self._defense_images: Optional[torch.Tensor] = None
         self._suspicion_ema: Dict[str, float] = {}
@@ -125,11 +130,15 @@ class FedAvgWithEval(FedAvg):
         self.defense_flagged_clients_per_round: list[list[str]] = []
         self._last_defense_stats: Dict[str, Scalar] = {
             "defense_flagged_clients": 0,
+            "defense_total_clients": 0,
             "defense_retained_clients": 0,
+            "defense_dropped_clients": 0,
             "defense_applied": 0,
             "defense_mad1": 0.0,
             "defense_mad2": 0.0,
             "defense_threshold": float(self.defense_mad_threshold),
+            "defense_flag_threshold": float(self.defense_flag_threshold),
+            "defense_hard_filter_enabled": int(self.defense_hard_filter),
             "defense_adaptive_threshold_used": 0,
             "defense_avg_trust_weight": 1.0,
             "defense_avg_malicious_prob": 0.0,
@@ -573,10 +582,14 @@ class FedAvgWithEval(FedAvg):
         stats: Dict[str, Scalar] = {
             "defense_applied": 0,
             "defense_flagged_clients": 0,
+            "defense_total_clients": len(results),
             "defense_retained_clients": len(results),
+            "defense_dropped_clients": 0,
             "defense_mad1": 0.0,
             "defense_mad2": 0.0,
             "defense_threshold": float(self.defense_mad_threshold),
+            "defense_flag_threshold": float(self.defense_flag_threshold),
+            "defense_hard_filter_enabled": int(self.defense_hard_filter),
             "defense_adaptive_threshold_used": 0,
             "defense_avg_trust_weight": 1.0,
             "defense_avg_malicious_prob": 0.0,
@@ -667,9 +680,33 @@ class FedAvgWithEval(FedAvg):
 
             self._last_client_trust_weights = dict(trust_map)
 
-            flagged_ids = [cid for cid, p in self._last_client_malicious_probs.items() if p >= 0.5]
-                # Store flagged client IDs for this round
-                self.defense_flagged_clients_per_round.append(list(flagged_ids))
+            flagged_ids = [
+                cid
+                for cid, p in self._last_client_malicious_probs.items()
+                if p >= self.defense_flag_threshold
+            ]
+            self.defense_flagged_clients_per_round.append(list(flagged_ids))
+
+            results_used = results
+            dropped_ids: List[str] = []
+            if self.defense_hard_filter:
+                filtered_results: List[Tuple[object, object]] = []
+                for idx, item in enumerate(results):
+                    cid = str(getattr(item[0], "cid", idx))
+                    mal_prob = float(self._last_client_malicious_probs.get(cid, 0.0))
+                    if mal_prob >= self.defense_flag_threshold:
+                        dropped_ids.append(cid)
+                        continue
+                    filtered_results.append(item)
+
+                if len(filtered_results) >= min_clients:
+                    results_used = filtered_results
+                else:
+                    dropped_ids = []
+                    print(
+                        f"  [Defense][Round {server_round}] hard-filter skipped "
+                        f"(would retain {len(filtered_results)}/{len(results)} < min_fit_clients={min_clients})."
+                    )
 
             stats.update(
                 {
@@ -679,7 +716,9 @@ class FedAvgWithEval(FedAvg):
                     "defense_threshold": float(adaptive_threshold),
                     "defense_adaptive_threshold_used": int(adaptive_used),
                     "defense_flagged_clients": len(flagged_ids),
-                    "defense_retained_clients": len(results),
+                    "defense_total_clients": len(results),
+                    "defense_retained_clients": len(results_used),
+                    "defense_dropped_clients": len(dropped_ids),
                     "defense_avg_trust_weight": float(np.mean(trust_weights)),
                     "defense_avg_malicious_prob": float(np.mean(malicious_probs)),
                     "defense_detector_weight_mad": float(self._detector_weights.get("mad", 0.25)),
@@ -692,11 +731,12 @@ class FedAvgWithEval(FedAvg):
             print(
                 f"  [Defense][Round {server_round}] "
                 f"soft-flagged {len(flagged_ids)}/{len(results)} clients "
+                f"| dropped={len(dropped_ids)} "
                 f"| avg trust={float(np.mean(trust_weights)):.3f} "
                 f"| avg P(mal)={float(np.mean(malicious_probs)):.3f} "
                 f"| threshold={adaptive_threshold:.3f}"
             )
-            return results, stats, trust_map
+            return results_used, stats, trust_map
         except Exception as ex:
             # Fail-open: keep training even if defense computation fails this round.
             print(f"  [Defense][Round {server_round}] skipped due to error: {ex}")
@@ -819,9 +859,12 @@ class FedAvgWithEval(FedAvg):
         if "semantic_backdoor_accuracy" in metrics:
             log += f" | Semantic ASR: {float(metrics['semantic_backdoor_accuracy'])*100:.2f}%"
         if float(metrics.get("defense_applied", 0)) > 0:
+            total_clients = int(metrics.get("defense_total_clients", metrics.get("defense_retained_clients", 0)))
+            dropped_clients = int(metrics.get("defense_dropped_clients", 0))
             log += (
                 f" | Defense soft-flagged: {int(metrics.get('defense_flagged_clients', 0))}"
-                f"/{int(metrics.get('defense_retained_clients', 0))}"
+                f"/{total_clients}"
+                f" | dropped={dropped_clients}"
                 f" | avg trust={float(metrics.get('defense_avg_trust_weight', 1.0)):.3f}"
             )
         print(log)
@@ -859,6 +902,8 @@ def build_server_app(
     defense_bayes_blend: float = 0.6,
     defense_adaptive_threshold: bool = True,
     defense_cv_folds: int = 3,
+    defense_hard_filter: bool = False,
+    defense_flag_threshold: float = 0.5,
     fraction_fit: float = 0.5,
     fraction_evaluate: float = 1.0,
     min_fit_clients: int = 2,
@@ -895,6 +940,8 @@ def build_server_app(
         defense_bayes_blend=defense_bayes_blend,
         defense_adaptive_threshold=defense_adaptive_threshold,
         defense_cv_folds=defense_cv_folds,
+        defense_hard_filter=defense_hard_filter,
+        defense_flag_threshold=defense_flag_threshold,
         fraction_fit=fraction_fit,
         fraction_evaluate=fraction_evaluate,
         min_fit_clients=min_fit_clients,
