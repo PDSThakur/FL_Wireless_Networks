@@ -105,6 +105,15 @@ def run_experiment(
     defense_grad_steps: int = 3,
     defense_grad_step_size: float = 0.01,
     defense_mad_threshold: float = 2.5,
+    defense_temporal_alpha: float = 0.3,
+    defense_expected_malicious_frac: float = 0.1,
+    defense_bayes_prior: float = 0.1,
+    defense_sigmoid_temperature: float = 1.0,
+    defense_min_trust_weight: float = 0.01,
+    defense_detector_momentum: float = 0.8,
+    defense_bayes_blend: float = 0.6,
+    defense_adaptive_threshold: bool = True,
+    defense_cv_folds: int = 3,
     min_fit_clients: int = 2,
     seed: int           = 42,
     results_dir: str    = "../results",
@@ -127,9 +136,11 @@ def run_experiment(
     print(f"  Server:     {server_device}  |  Client: {client_device} (Ray num_gpus={client_num_gpus})")
     if defense_enabled:
         print(
-            "  Defense:    DifFense(DiffTest+TwoStepMAD) "
+            "  Defense:    DifFense+Adaptive+Temporal+Ensemble+Bayesian "
             f"| samples={defense_max_samples} pca={defense_pca_components} "
             f"steps={defense_grad_steps} lr={defense_grad_step_size} th={defense_mad_threshold} "
+            f"| alpha={defense_temporal_alpha} prior={defense_bayes_prior} "
+            f"| adaptive={int(defense_adaptive_threshold)} cv={defense_cv_folds} "
             f"| min_fit_clients={max(2, min(int(min_fit_clients), num_clients))}"
         )
     print(f"{'='*60}")
@@ -267,6 +278,15 @@ def run_experiment(
         defense_grad_steps = defense_grad_steps,
         defense_grad_step_size = defense_grad_step_size,
         defense_mad_threshold = defense_mad_threshold,
+        defense_temporal_alpha = defense_temporal_alpha,
+        defense_expected_malicious_frac = defense_expected_malicious_frac,
+        defense_bayes_prior = defense_bayes_prior,
+        defense_sigmoid_temperature = defense_sigmoid_temperature,
+        defense_min_trust_weight = defense_min_trust_weight,
+        defense_detector_momentum = defense_detector_momentum,
+        defense_bayes_blend = defense_bayes_blend,
+        defense_adaptive_threshold = defense_adaptive_threshold,
+        defense_cv_folds = defense_cv_folds,
         fraction_fit      = fraction_fit,
         fraction_evaluate = 1.0,
         min_fit_clients   = max(2, min(int(min_fit_clients), num_clients)),
@@ -291,6 +311,7 @@ def run_experiment(
     print("[4/4] Saving results...")
     tracker.save_csv()
 
+
     # Compute communication cost
     model    = get_model(dataset)
     comm_mb  = compute_comm_cost_mb(
@@ -298,6 +319,28 @@ def run_experiment(
         num_clients  = int(fraction_fit * num_clients),
         num_rounds   = num_rounds,
     )
+
+    # FPR/FNR calculation (if defense enabled)
+    mean_fpr = mean_fnr = None
+    if defense_enabled and hasattr(server_app, 'strategy') and hasattr(server_app.strategy, 'get_defense_flagged_clients_per_round'):
+        flagged_per_round = server_app.strategy.get_defense_flagged_clients_per_round()
+        all_client_ids = set(str(i) for i in range(num_clients))
+        malicious_set = set(str(i) for i in malicious_client_ids)
+        benign_set = all_client_ids - malicious_set
+        fprs, fnrs = [], []
+        for flagged in flagged_per_round:
+            flagged_set = set(flagged)
+            # FPR: benign clients flagged / total benign
+            benign_flagged = len(flagged_set & benign_set)
+            fpr = benign_flagged / len(benign_set) if benign_set else 0.0
+            # FNR: malicious clients NOT flagged / total malicious
+            missed_malicious = len(malicious_set - flagged_set)
+            fnr = missed_malicious / len(malicious_set) if malicious_set else 0.0
+            fprs.append(fpr)
+            fnrs.append(fnr)
+        mean_fpr = float(np.mean(fprs)) if fprs else 0.0
+        mean_fnr = float(np.mean(fnrs)) if fnrs else 0.0
+        print(f"[Defense] Mean FPR: {mean_fpr*100:.2f}% | Mean FNR: {mean_fnr*100:.2f}% over {len(flagged_per_round)} rounds.")
 
     summary = tracker.summary()
     summary.update({
@@ -322,7 +365,18 @@ def run_experiment(
         "defense_grad_steps": defense_grad_steps,
         "defense_grad_step_size": defense_grad_step_size,
         "defense_mad_threshold": defense_mad_threshold,
+        "defense_temporal_alpha": defense_temporal_alpha,
+        "defense_expected_malicious_frac": defense_expected_malicious_frac,
+        "defense_bayes_prior": defense_bayes_prior,
+        "defense_sigmoid_temperature": defense_sigmoid_temperature,
+        "defense_min_trust_weight": defense_min_trust_weight,
+        "defense_detector_momentum": defense_detector_momentum,
+        "defense_bayes_blend": defense_bayes_blend,
+        "defense_adaptive_threshold": int(defense_adaptive_threshold),
+        "defense_cv_folds": defense_cv_folds,
         "min_fit_clients": max(2, min(int(min_fit_clients), num_clients)),
+        "mean_fpr": mean_fpr,
+        "mean_fnr": mean_fnr,
     })
 
     return summary
@@ -348,6 +402,15 @@ def run_all_experiments(
     defense_grad_steps: int = 3,
     defense_grad_step_size: float = 0.01,
     defense_mad_threshold: float = 2.5,
+    defense_temporal_alpha: float = 0.3,
+    defense_expected_malicious_frac: float = 0.1,
+    defense_bayes_prior: float = 0.1,
+    defense_sigmoid_temperature: float = 1.0,
+    defense_min_trust_weight: float = 0.01,
+    defense_detector_momentum: float = 0.8,
+    defense_bayes_blend: float = 0.6,
+    defense_adaptive_threshold: bool = True,
+    defense_cv_folds: int = 3,
     min_fit_clients: int = 2,
 ):
     """
@@ -393,6 +456,15 @@ def run_all_experiments(
                     defense_grad_steps = defense_grad_steps,
                     defense_grad_step_size = defense_grad_step_size,
                     defense_mad_threshold = defense_mad_threshold,
+                    defense_temporal_alpha = defense_temporal_alpha,
+                    defense_expected_malicious_frac = defense_expected_malicious_frac,
+                    defense_bayes_prior = defense_bayes_prior,
+                    defense_sigmoid_temperature = defense_sigmoid_temperature,
+                    defense_min_trust_weight = defense_min_trust_weight,
+                    defense_detector_momentum = defense_detector_momentum,
+                    defense_bayes_blend = defense_bayes_blend,
+                    defense_adaptive_threshold = defense_adaptive_threshold,
+                    defense_cv_folds = defense_cv_folds,
                     min_fit_clients = min_fit_clients,
                     results_dir = results_dir,
                 )
@@ -471,7 +543,7 @@ def parse_args():
     parser.add_argument("--poison_rate", type=float, default=0.0,
                         help="Fraction of eligible local samples poisoned on each malicious client")
     parser.add_argument("--defense_enabled", action="store_true",
-                        help="Enable DifFense-style filtering (Differential Testing + Two-Step MAD)")
+                        help="Enable advanced DifFense pipeline (adaptive + temporal + ensemble + Bayesian + soft weighting)")
     parser.add_argument("--defense_max_samples", type=int, default=64,
                         help="Number of server images used for differential testing")
     parser.add_argument("--defense_pca_components", type=int, default=5,
@@ -482,6 +554,24 @@ def parse_args():
                         help="Step size for differential-input gradient ascent")
     parser.add_argument("--defense_mad_threshold", type=float, default=2.5,
                         help="Threshold on two-step MAD normalized deviation")
+    parser.add_argument("--defense_temporal_alpha", type=float, default=0.3,
+                        help="EMA decay for temporal suspicion memory (0..1)")
+    parser.add_argument("--defense_expected_malicious_frac", type=float, default=0.1,
+                        help="Expected malicious fraction used by ensemble detectors")
+    parser.add_argument("--defense_bayes_prior", type=float, default=0.1,
+                        help="Prior malicious probability for Bayesian posterior")
+    parser.add_argument("--defense_sigmoid_temperature", type=float, default=1.0,
+                        help="Temperature for soft-weight sigmoid around adaptive threshold")
+    parser.add_argument("--defense_min_trust_weight", type=float, default=0.01,
+                        help="Lower bound on client trust weight during aggregation")
+    parser.add_argument("--defense_detector_momentum", type=float, default=0.8,
+                        help="EMA momentum for detector reliability updates")
+    parser.add_argument("--defense_bayes_blend", type=float, default=0.6,
+                        help="Blend ratio for Bayesian posterior vs ensemble vote (0..1)")
+    parser.add_argument("--defense_disable_adaptive_threshold", action="store_true",
+                        help="Disable adaptive valley-seeking thresholding and use fixed MAD threshold")
+    parser.add_argument("--defense_cv_folds", type=int, default=3,
+                        help="K-fold count for adaptive threshold model selection")
     parser.add_argument("--min_fit_clients", type=int, default=2,
                         help="Minimum number of client updates required to aggregate each round")
     parser.add_argument("--seed",        type=int,   default=42,
@@ -516,6 +606,15 @@ if __name__ == "__main__":
             defense_grad_steps=args.defense_grad_steps,
             defense_grad_step_size=args.defense_grad_step_size,
             defense_mad_threshold=args.defense_mad_threshold,
+            defense_temporal_alpha=args.defense_temporal_alpha,
+            defense_expected_malicious_frac=args.defense_expected_malicious_frac,
+            defense_bayes_prior=args.defense_bayes_prior,
+            defense_sigmoid_temperature=args.defense_sigmoid_temperature,
+            defense_min_trust_weight=args.defense_min_trust_weight,
+            defense_detector_momentum=args.defense_detector_momentum,
+            defense_bayes_blend=args.defense_bayes_blend,
+            defense_adaptive_threshold=not args.defense_disable_adaptive_threshold,
+            defense_cv_folds=args.defense_cv_folds,
             min_fit_clients=args.min_fit_clients,
         )
     else:
@@ -547,6 +646,15 @@ if __name__ == "__main__":
             defense_grad_steps = args.defense_grad_steps,
             defense_grad_step_size = args.defense_grad_step_size,
             defense_mad_threshold = args.defense_mad_threshold,
+            defense_temporal_alpha = args.defense_temporal_alpha,
+            defense_expected_malicious_frac = args.defense_expected_malicious_frac,
+            defense_bayes_prior = args.defense_bayes_prior,
+            defense_sigmoid_temperature = args.defense_sigmoid_temperature,
+            defense_min_trust_weight = args.defense_min_trust_weight,
+            defense_detector_momentum = args.defense_detector_momentum,
+            defense_bayes_blend = args.defense_bayes_blend,
+            defense_adaptive_threshold = not args.defense_disable_adaptive_threshold,
+            defense_cv_folds = args.defense_cv_folds,
             min_fit_clients = args.min_fit_clients,
             seed         = args.seed,
             results_dir  = args.results_dir,
