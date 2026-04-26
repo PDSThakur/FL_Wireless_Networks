@@ -118,3 +118,16 @@ Example (semantic attack):
 ```bash
 python run_fedavg.py --dataset cifar10 --num_clients 10 --num_rounds 50 --alpha 0.5 --attack_type semantic --malicious_frac 0.2 --poison_rate 0.3 --backdoor_target_label 0 --semantic_source_label 1
 ```
+
+## Multi-Seed Sweep (Paper-ready)
+
+Run a seed x attack-strength sweep and auto-export:
+- Raw per-run CSV
+- Mean/std summary CSV
+- Clean accuracy + ASR + defense-F1 plots
+- Paper summary text file
+
+Example:
+```bash
+python run_fedavg.py --run_sweep --dataset cifar10 --num_clients 10 --num_rounds 15 --alpha 0.5 --attack_type semantic --defense_enabled --sweep_seeds 42,123,2024 --sweep_malicious_fracs 0.1,0.3,0.5 --sweep_poison_rates 0.1,0.3,0.5
+```

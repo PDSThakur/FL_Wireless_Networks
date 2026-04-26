@@ -109,7 +109,11 @@ class FedAvgClient(NumPyClient):
         return (
             self.get_parameters(config={}),
             len(self.train_loader.dataset),
-            {"train_loss": loss, "train_accuracy": acc},
+            {
+                "train_loss": loss,
+                "train_accuracy": acc,
+                "client_id": int(self.client_id),
+            },
         )
 
     def evaluate(
