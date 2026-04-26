@@ -53,46 +53,105 @@ def weighted_average(metrics: List[Tuple[int, Metrics]]) -> Metrics:
 # Layer 3 Defense: Trimmed Mean + Foolsgold
 # ─────────────────────────────────────────────
 def trimmed_mean_aggregate(
-    updates: List[Tuple[np.ndarray, int]],  # (parameters, num_samples)
+    updates: List[Tuple[List[np.ndarray], int]],  # (parameters, num_samples)
     trim_fraction: float = 0.1,
-) -> np.ndarray:
+) -> List[np.ndarray]:
     """
     Trimmed Mean: Remove top/bottom trim_fraction of updates before averaging.
+    Handles each layer separately since model parameters have different shapes.
     """
     if len(updates) < 3:
-        return np.average([u for u, _ in updates], axis=0, weights=[n for _, n in updates])
+        # Fall back to weighted average
+        total_samples = sum(n for _, n in updates)
+        result = []
+        for layer_idx in range(len(updates[0][0])):
+            layer_sum = np.zeros_like(updates[0][0][layer_idx], dtype=np.float64)
+            for params, n in updates:
+                layer_sum += params[layer_idx].astype(np.float64) * n
+            result.append(layer_sum / total_samples)
+        return result
 
-    # Stack all parameter updates
-    stacked = np.array([u for u, _ in updates])
     num_updates = len(updates)
     trim_count = max(1, int(num_updates * trim_fraction))
-
-    # For each parameter dimension, trim extremes
-    aggregated = []
-    for i in range(stacked.shape[1]):
-        layer_params = stacked[:, i, :]
-        # Flatten for trimming
-        flat = layer_params.reshape(num_updates, -1)
+    
+    # Process each layer separately
+    num_layers = len(updates[0][0])
+    result = []
+    
+    for layer_idx in range(num_layers):
+        # Get all updates for this layer
+        layer_params = [params[layer_idx].astype(np.float64) for params, _ in updates]
         
-        # Compute mean per update for ranking
-        norms = np.linalg.norm(flat, axis=1)
+        # Compute L2 norm for each update (for ranking)
+        norms = np.array([np.linalg.norm(p) for p in layer_params])
         
         # Get indices to keep (exclude top/bottom trim_count)
-        keep_indices = np.argsort(norms)[trim_count:-trim_count] if trim_count > 0 else np.arange(num_updates)
+        sorted_indices = np.argsort(norms)
+        keep_indices = sorted_indices[trim_count:-trim_count] if trim_count > 0 else sorted_indices
+        
+        if len(keep_indices) == 0:
+            keep_indices = sorted_indices  # Keep all if trim removes everything
         
         # Average remaining updates
-        kept = stacked[keep_indices, i, :]
-        aggregated.append(np.mean(kept, axis=0))
-
-    return np.array(aggregated, dtype=object)
+        kept_params = [layer_params[i] for i in keep_indices]
+        avg_param = np.mean(kept_params, axis=0)
+        result.append(avg_param)
+    
+    return result
 
 
 def foolsgold_aggregate(
-    updates: List[Tuple[np.ndarray, int]],  # (parameters, num_samples)
+    updates: List[Tuple[List[np.ndarray], int]],  # (parameters, num_samples)
     foolsgold_threshold: float = 0.5,
-) -> Tuple[np.ndarray, List[int]]:
+) -> Tuple[List[np.ndarray], List[int]]:
     """
     Foolsgold: Detect adversarial clients by measuring update similarity.
+    Returns aggregated parameters and indices of flagged clients.
+    """
+    if len(updates) < 2:
+        return [u for u, _ in updates], []
+
+    # Flatten each update into a single vector (concatenate all layers)
+    flattened = []
+    for params, _ in updates:
+        flat = np.concatenate([p.flatten() for p in params])
+        flattened.append(flat)
+    
+    flattened = np.array(flattened, dtype=np.float64)
+    
+    # Compute cosine similarity matrix
+    norms = np.linalg.norm(flattened, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1e-10, norms)  # Avoid division by zero
+    normalized = flattened / norms
+    similarity_matrix = np.dot(normalized, normalized.T)
+
+    # Compute maximum similarity for each client to any other
+    np.fill_diagonal(similarity_matrix, 0)
+    max_similarities = np.max(similarity_matrix, axis=1)
+
+    # Flag clients with suspiciously high similarity
+    flagged = np.where(max_similarities > foolsgold_threshold)[0].tolist()
+
+    # Weight by inverse similarity (less similar = higher weight)
+    weights = 1.0 - max_similarities
+    weights = np.maximum(weights, 0.01)  # Ensure positive weights
+    weights = weights / weights.sum()
+
+    # Weighted average per layer
+    num_layers = len(updates[0][0])
+    result = []
+    
+    for layer_idx in range(num_layers):
+        layer_params = [params[layer_idx].astype(np.float64) for params, _ in updates]
+        layer_flat = np.array([p.flatten() for p in layer_params])
+        
+        # Weighted average
+        weighted_avg = np.average(layer_flat, axis=0, weights=weights)
+        
+        # Reshape back to original layer shape
+        result.append(weighted_avg.reshape(layer_params[0].shape))
+    
+    return result, flagged
     Returns aggregated parameters and indices of flagged clients.
     """
     if len(updates) < 2:
@@ -538,16 +597,12 @@ class FedAvgWithEval(FedAvg):
                         layer3_updates, 
                         trim_fraction=self.layer3_trim_fraction
                     )
-                    # Create new parameters from trimmed mean result
-                    from flwr.common import Parameters
-                    new_params = Parameters(tensor=aggregated.tobytes(), tensor_type=aggregated.dtype)
+                    # Convert list of arrays to Parameters
+                    new_params = ndarrays_to_parameters(aggregated)
                     
-                    # Override the parent's aggregation with trimmed mean
-                    aggregated_params, aggregated_metrics = super().aggregate_fit(
-                        server_round, filtered_results, failures
-                    )
-                    # Replace with trimmed mean parameters
+                    # Use trimmed mean parameters instead of parent's aggregation
                     aggregated_params = new_params
+                    aggregated_metrics = {}
                     self._last_defense_stats["layer3_trimmed_mean_applied"] = 1
                     print(f"  [Layer3][Round {server_round}] Trimmed Mean applied (trim={self.layer3_trim_fraction})")
                 except Exception as e:
@@ -563,6 +618,11 @@ class FedAvgWithEval(FedAvg):
                         layer3_updates,
                         foolsgold_threshold=self.layer3_foolsgold_threshold
                     )
+                    # Convert list of arrays to Parameters
+                    new_params = ndarrays_to_parameters(aggregated)
+                    
+                    aggregated_params = new_params
+                    aggregated_metrics = {}
                     self._last_defense_stats["layer3_foolsgold_applied"] = 1
                     self._last_defense_stats["layer3_foolsgold_flagged"] = len(flagged_indices)
                     print(f"  [Layer3][Round {server_round}] Foolsgold flagged {len(flagged_indices)} clients")
