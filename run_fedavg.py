@@ -8,6 +8,7 @@ Usage:
 """
 
 import argparse
+import itertools
 import os
 import random
 import sys
@@ -32,7 +33,18 @@ from data   import (
     build_poisoned_client_train_loader,
     partition_stats,
 )
-from utils  import MetricsTracker, compute_comm_cost_mb, plot_accuracy_vs_rounds, plot_loss_vs_rounds, plot_iid_vs_noniid, print_results_table
+from utils  import (
+    MetricsTracker,
+    aggregate_results_mean_std,
+    compute_comm_cost_mb,
+    plot_accuracy_vs_rounds,
+    plot_loss_vs_rounds,
+    plot_iid_vs_noniid,
+    plot_sweep_metric,
+    print_results_table,
+    save_rows_csv,
+    write_sweep_summary_text,
+)
 from client import build_client_app
 from server import build_server_app
 
@@ -105,6 +117,11 @@ def run_experiment(
     defense_grad_steps: int = 3,
     defense_grad_step_size: float = 0.01,
     defense_mad_threshold: float = 2.5,
+    # Layer 3 Defense
+    layer3_trimmed_mean: bool = False,
+    layer3_trim_fraction: float = 0.1,
+    layer3_foolsgold: bool = False,
+    layer3_foolsgold_threshold: float = 0.5,
     min_fit_clients: int = 2,
     seed: int           = 42,
     results_dir: str    = "../results",
@@ -126,11 +143,17 @@ def run_experiment(
     print(f"  Alpha:      {alpha_str}")
     print(f"  Server:     {server_device}  |  Client: {client_device} (Ray num_gpus={client_num_gpus})")
     if defense_enabled:
+        layer3_info = ""
+        if layer3_trimmed_mean:
+            layer3_info += f" +TrimmedMean(trim={layer3_trim_fraction})"
+        if layer3_foolsgold:
+            layer3_info += f" +Foolsgold(th={layer3_foolsgold_threshold})"
         print(
             "  Defense:    DifFense(DiffTest+TwoStepMAD) "
             f"| samples={defense_max_samples} pca={defense_pca_components} "
             f"steps={defense_grad_steps} lr={defense_grad_step_size} th={defense_mad_threshold} "
             f"| min_fit_clients={max(2, min(int(min_fit_clients), num_clients))}"
+            f"{layer3_info}"
         )
     print(f"{'='*60}")
 
@@ -267,6 +290,12 @@ def run_experiment(
         defense_grad_steps = defense_grad_steps,
         defense_grad_step_size = defense_grad_step_size,
         defense_mad_threshold = defense_mad_threshold,
+        malicious_client_ids = malicious_client_ids,
+        # Layer 3 Defense
+        layer3_trimmed_mean = layer3_trimmed_mean,
+        layer3_trim_fraction = layer3_trim_fraction,
+        layer3_foolsgold = layer3_foolsgold,
+        layer3_foolsgold_threshold = layer3_foolsgold_threshold,
         fraction_fit      = fraction_fit,
         fraction_evaluate = 1.0,
         min_fit_clients   = max(2, min(int(min_fit_clients), num_clients)),
@@ -306,6 +335,7 @@ def run_experiment(
         "num_clients": num_clients,
         "num_rounds":  num_rounds,
         "alpha":       alpha_str,
+        "seed":        seed,
         "comm_mb":     f"{comm_mb:.1f}",
         "client_num_gpus": client_num_gpus,
         "backdoor_target_label": backdoor_target_label,
@@ -348,6 +378,11 @@ def run_all_experiments(
     defense_grad_steps: int = 3,
     defense_grad_step_size: float = 0.01,
     defense_mad_threshold: float = 2.5,
+    # Layer 3 Defense
+    layer3_trimmed_mean: bool = False,
+    layer3_trim_fraction: float = 0.1,
+    layer3_foolsgold: bool = False,
+    layer3_foolsgold_threshold: float = 0.5,
     min_fit_clients: int = 2,
 ):
     """
@@ -393,6 +428,11 @@ def run_all_experiments(
                     defense_grad_steps = defense_grad_steps,
                     defense_grad_step_size = defense_grad_step_size,
                     defense_mad_threshold = defense_mad_threshold,
+                    # Layer 3 Defense
+                    layer3_trimmed_mean = layer3_trimmed_mean,
+                    layer3_trim_fraction = layer3_trim_fraction,
+                    layer3_foolsgold = layer3_foolsgold,
+                    layer3_foolsgold_threshold = layer3_foolsgold_threshold,
                     min_fit_clients = min_fit_clients,
                     results_dir = results_dir,
                 )
@@ -413,16 +453,212 @@ def run_all_experiments(
     # Print summary table
     print_results_table(all_results)
 
-    # Save combined results CSV
-    import csv
     combined_path = os.path.join(results_dir, "fedavg_all_results.csv")
-    if all_results:
-        with open(combined_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=all_results[0].keys())
-            writer.writeheader()
-            writer.writerows(all_results)
+    save_rows_csv(all_results, combined_path)
     print(f"\nAll results saved to: {combined_path}")
 
+    return all_results
+
+
+def _parse_csv_ints(raw: str) -> List[int]:
+    values = [x.strip() for x in str(raw).split(",") if x.strip()]
+    return [int(v) for v in values]
+
+
+def _parse_csv_floats(raw: str) -> List[float]:
+    values = [x.strip() for x in str(raw).split(",") if x.strip()]
+    return [float(v) for v in values]
+
+
+def _has_metric(rows: List[dict], metric_key: str) -> bool:
+    col = f"{metric_key}_mean"
+    for row in rows:
+        try:
+            val = float(row.get(col, np.nan))
+            if np.isfinite(val):
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
+def run_seed_attack_sweep(
+    dataset: str,
+    num_clients: int,
+    num_rounds: int,
+    alpha,
+    seeds: List[int],
+    malicious_fracs: List[float],
+    poison_rates: List[float],
+    local_epochs: int = 5,
+    batch_size: int = 32,
+    learning_rate: float = 0.01,
+    momentum: float = 0.9,
+    fraction_fit: float = 0.5,
+    client_num_gpus: float = 0.0,
+    backdoor_target_label: int = 0,
+    semantic_source_label: int = 1,
+    pixel_trigger_size: int = 3,
+    pixel_trigger_value: float = 1.0,
+    disable_backdoor_eval: bool = False,
+    attack_type: str = "none",
+    defense_enabled: bool = False,
+    defense_max_samples: int = 64,
+    defense_pca_components: int = 5,
+    defense_grad_steps: int = 3,
+    defense_grad_step_size: float = 0.01,
+    defense_mad_threshold: float = 2.5,
+    min_fit_clients: int = 2,
+    results_dir: str = "../results",
+) -> List[dict]:
+    """
+    Run a sweep over seed x malicious_frac x poison_rate and export
+    paper-ready CSVs, plots, and a short summary text.
+    """
+    os.makedirs(results_dir, exist_ok=True)
+
+    alpha_str = str(alpha)
+    sweep_tag = (
+        f"sweep_{dataset}_c{num_clients}_r{num_rounds}_a{alpha_str}_"
+        f"{attack_type}_def{int(defense_enabled)}"
+    ).replace(".", "p")
+
+    combos = list(itertools.product(seeds, malicious_fracs, poison_rates))
+    print(f"\nStarting sweep with {len(combos)} runs...")
+    print(f"  Seeds: {seeds}")
+    print(f"  Malicious fracs: {malicious_fracs}")
+    print(f"  Poison rates: {poison_rates}")
+    print(f"  Results dir: {results_dir}")
+
+    all_results: List[dict] = []
+    for run_idx, (seed, malicious_frac, poison_rate) in enumerate(combos, start=1):
+        print(
+            f"\n[Sweep {run_idx}/{len(combos)}] "
+            f"seed={seed}, malicious_frac={malicious_frac}, poison_rate={poison_rate}"
+        )
+        result = run_experiment(
+            dataset=dataset,
+            num_clients=num_clients,
+            num_rounds=num_rounds,
+            alpha=alpha,
+            local_epochs=local_epochs,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            momentum=momentum,
+            fraction_fit=fraction_fit,
+            client_num_gpus=client_num_gpus,
+            backdoor_target_label=backdoor_target_label,
+            semantic_source_label=semantic_source_label,
+            pixel_trigger_size=pixel_trigger_size,
+            pixel_trigger_value=pixel_trigger_value,
+            disable_backdoor_eval=disable_backdoor_eval,
+            attack_type=attack_type,
+            malicious_frac=malicious_frac,
+            poison_rate=poison_rate,
+            defense_enabled=defense_enabled,
+            defense_max_samples=defense_max_samples,
+            defense_pca_components=defense_pca_components,
+            defense_grad_steps=defense_grad_steps,
+            defense_grad_step_size=defense_grad_step_size,
+            defense_mad_threshold=defense_mad_threshold,
+            min_fit_clients=min_fit_clients,
+            seed=seed,
+            results_dir=results_dir,
+        )
+        result["sweep_run_index"] = run_idx
+        all_results.append(result)
+
+    metric_keys = [
+        "final_accuracy",
+        "final_loss",
+        "final_pixel_backdoor_accuracy",
+        "final_semantic_backdoor_accuracy",
+        "final_defense_precision",
+        "final_defense_recall",
+        "final_defense_f1",
+        "avg_defense_precision",
+        "avg_defense_recall",
+        "avg_defense_f1",
+        "avg_defense_false_positive_rate",
+        "avg_defense_true_positive_rate",
+        "avg_defense_flagged_clients",
+    ]
+    group_keys = [
+        "dataset",
+        "num_clients",
+        "num_rounds",
+        "alpha",
+        "attack_type",
+        "defense_enabled",
+        "malicious_frac",
+        "poison_rate",
+    ]
+    aggregated = aggregate_results_mean_std(
+        rows=all_results,
+        group_keys=group_keys,
+        metric_keys=metric_keys,
+    )
+    aggregated = sorted(
+        aggregated,
+        key=lambda r: (
+            float(r.get("malicious_frac", 0.0)),
+            float(r.get("poison_rate", 0.0)),
+        ),
+    )
+
+    raw_csv_path = os.path.join(results_dir, f"{sweep_tag}_raw.csv")
+    summary_csv_path = os.path.join(results_dir, f"{sweep_tag}_summary.csv")
+    summary_text_path = os.path.join(results_dir, f"{sweep_tag}_paper_summary.txt")
+    save_rows_csv(all_results, raw_csv_path)
+    save_rows_csv(aggregated, summary_csv_path)
+    write_sweep_summary_text(all_results, aggregated, summary_text_path)
+
+    plot_sweep_metric(
+        rows=aggregated,
+        x_key="poison_rate",
+        series_key="malicious_frac",
+        metric_key="final_accuracy",
+        save_path=os.path.join(results_dir, f"{sweep_tag}_clean_accuracy.png"),
+        title="Final Clean Accuracy vs Poison Rate",
+        y_label="Final Accuracy",
+    )
+
+    if _has_metric(aggregated, "final_semantic_backdoor_accuracy"):
+        plot_sweep_metric(
+            rows=aggregated,
+            x_key="poison_rate",
+            series_key="malicious_frac",
+            metric_key="final_semantic_backdoor_accuracy",
+            save_path=os.path.join(results_dir, f"{sweep_tag}_semantic_asr.png"),
+            title="Final Semantic ASR vs Poison Rate",
+            y_label="Semantic ASR",
+        )
+    if _has_metric(aggregated, "final_pixel_backdoor_accuracy"):
+        plot_sweep_metric(
+            rows=aggregated,
+            x_key="poison_rate",
+            series_key="malicious_frac",
+            metric_key="final_pixel_backdoor_accuracy",
+            save_path=os.path.join(results_dir, f"{sweep_tag}_pixel_asr.png"),
+            title="Final Pixel ASR vs Poison Rate",
+            y_label="Pixel ASR",
+        )
+    if defense_enabled and _has_metric(aggregated, "avg_defense_f1"):
+        plot_sweep_metric(
+            rows=aggregated,
+            x_key="poison_rate",
+            series_key="malicious_frac",
+            metric_key="avg_defense_f1",
+            save_path=os.path.join(results_dir, f"{sweep_tag}_defense_f1.png"),
+            title="Average Defense F1 vs Poison Rate",
+            y_label="Defense F1",
+        )
+
+    print("\nSweep export complete:")
+    print(f"  Raw CSV:      {raw_csv_path}")
+    print(f"  Summary CSV:  {summary_csv_path}")
+    print(f"  Summary text: {summary_text_path}")
+    print_results_table(all_results[: min(5, len(all_results))])
     return all_results
 
 
@@ -482,6 +718,17 @@ def parse_args():
                         help="Step size for differential-input gradient ascent")
     parser.add_argument("--defense_mad_threshold", type=float, default=2.5,
                         help="Threshold on two-step MAD normalized deviation")
+    
+    # Layer 3 Defense: Trimmed Mean + Foolsgold
+    parser.add_argument("--layer3_trimmed_mean", action="store_true",
+                        help="Enable Trimmed Mean as Layer 3 defense")
+    parser.add_argument("--layer3_trim_fraction", type=float, default=0.1,
+                        help="Fraction of updates to trim (0.0-0.5)")
+    parser.add_argument("--layer3_foolsgold", action="store_true",
+                        help="Enable Foolsgold as Layer 3 defense")
+    parser.add_argument("--layer3_foolsgold_threshold", type=float, default=0.5,
+                        help="Foolsgold similarity threshold (0.0-1.0)")
+    
     parser.add_argument("--min_fit_clients", type=int, default=2,
                         help="Minimum number of client updates required to aggregate each round")
     parser.add_argument("--seed",        type=int,   default=42,
@@ -490,12 +737,21 @@ def parse_args():
                         help="Directory to save results and plots")
     parser.add_argument("--run_all",     action="store_true",
                         help="Run all required configurations automatically")
+    parser.add_argument("--run_sweep",   action="store_true",
+                        help="Run multi-seed attack sweep and export paper-ready outputs")
+    parser.add_argument("--sweep_seeds", type=str, default="42,123,2024",
+                        help="Comma-separated seeds for sweep, e.g. '42,123,2024'")
+    parser.add_argument("--sweep_malicious_fracs", type=str, default="0.1,0.3,0.5",
+                        help="Comma-separated malicious fractions for sweep")
+    parser.add_argument("--sweep_poison_rates", type=str, default="0.1,0.3,0.5",
+                        help="Comma-separated poison rates for sweep")
 
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    alpha = args.alpha if args.alpha.lower() == "iid" else float(args.alpha)
 
     if args.run_all:
         print("\n Running ALL required experimental configurations...\n")
@@ -516,12 +772,55 @@ if __name__ == "__main__":
             defense_grad_steps=args.defense_grad_steps,
             defense_grad_step_size=args.defense_grad_step_size,
             defense_mad_threshold=args.defense_mad_threshold,
+            # Layer 3 Defense
+            layer3_trimmed_mean=args.layer3_trimmed_mean,
+            layer3_trim_fraction=args.layer3_trim_fraction,
+            layer3_foolsgold=args.layer3_foolsgold,
+            layer3_foolsgold_threshold=args.layer3_foolsgold_threshold,
             min_fit_clients=args.min_fit_clients,
         )
-    else:
-        # Parse alpha
-        alpha = args.alpha if args.alpha.lower() == "iid" else float(args.alpha)
+    elif args.run_sweep:
+        seeds = _parse_csv_ints(args.sweep_seeds)
+        malicious_fracs = _parse_csv_floats(args.sweep_malicious_fracs)
+        poison_rates = _parse_csv_floats(args.sweep_poison_rates)
 
+        if len(seeds) == 0:
+            raise ValueError("sweep_seeds must provide at least one seed.")
+        if len(malicious_fracs) == 0:
+            raise ValueError("sweep_malicious_fracs must provide at least one value.")
+        if len(poison_rates) == 0:
+            raise ValueError("sweep_poison_rates must provide at least one value.")
+
+        run_seed_attack_sweep(
+            dataset=args.dataset,
+            num_clients=args.num_clients,
+            num_rounds=args.num_rounds,
+            alpha=alpha,
+            seeds=seeds,
+            malicious_fracs=malicious_fracs,
+            poison_rates=poison_rates,
+            local_epochs=args.local_epochs,
+            batch_size=args.batch_size,
+            learning_rate=args.lr,
+            momentum=args.momentum,
+            fraction_fit=args.fraction_fit,
+            client_num_gpus=args.client_num_gpus,
+            backdoor_target_label=args.backdoor_target_label,
+            semantic_source_label=args.semantic_source_label,
+            pixel_trigger_size=args.pixel_trigger_size,
+            pixel_trigger_value=args.pixel_trigger_value,
+            disable_backdoor_eval=args.disable_backdoor_eval,
+            attack_type=args.attack_type,
+            defense_enabled=args.defense_enabled,
+            defense_max_samples=args.defense_max_samples,
+            defense_pca_components=args.defense_pca_components,
+            defense_grad_steps=args.defense_grad_steps,
+            defense_grad_step_size=args.defense_grad_step_size,
+            defense_mad_threshold=args.defense_mad_threshold,
+            min_fit_clients=args.min_fit_clients,
+            results_dir=args.results_dir,
+        )
+    else:
         result = run_experiment(
             dataset      = args.dataset,
             num_clients  = args.num_clients,
@@ -547,6 +846,11 @@ if __name__ == "__main__":
             defense_grad_steps = args.defense_grad_steps,
             defense_grad_step_size = args.defense_grad_step_size,
             defense_mad_threshold = args.defense_mad_threshold,
+            # Layer 3 Defense
+            layer3_trimmed_mean = args.layer3_trimmed_mean,
+            layer3_trim_fraction = args.layer3_trim_fraction,
+            layer3_foolsgold = args.layer3_foolsgold,
+            layer3_foolsgold_threshold = args.layer3_foolsgold_threshold,
             min_fit_clients = args.min_fit_clients,
             seed         = args.seed,
             results_dir  = args.results_dir,

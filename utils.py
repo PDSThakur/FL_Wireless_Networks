@@ -175,6 +175,29 @@ class MetricsTracker:
         if defense_flags:
             out["final_defense_flagged_clients"] = defense_flags[-1]
             out["avg_defense_flagged_clients"] = float(np.mean(defense_flags))
+        detection_metrics = [
+            "defense_precision",
+            "defense_recall",
+            "defense_f1",
+            "defense_false_positive_rate",
+            "defense_true_positive_rate",
+            "defense_true_positives",
+            "defense_false_positives",
+            "defense_false_negatives",
+            "defense_true_negatives",
+            "defense_malicious_participants",
+            "defense_benign_participants",
+        ]
+        for key in detection_metrics:
+            values = self.history.get(key, [])
+            if not values:
+                continue
+            numeric = np.array(values, dtype=float)
+            valid = numeric[~np.isnan(numeric)]
+            if valid.size == 0:
+                continue
+            out[f"final_{key}"] = float(valid[-1])
+            out[f"avg_{key}"] = float(np.mean(valid))
         return out
 
 
@@ -335,3 +358,188 @@ def print_results_table(rows: List[Dict]):
         line = " | ".join(str(row.get(k, "")).ljust(widths[k]) for k in keys)
         print(line)
     print(f"{'='*len(header)}\n")
+
+
+def save_rows_csv(rows: List[Dict], path: str) -> None:
+    """Save a list of dict rows to CSV using union of all keys."""
+    if not rows:
+        return
+    key_order = list(rows[0].keys())
+    key_set = set(key_order)
+    for row in rows[1:]:
+        for key in row.keys():
+            if key not in key_set:
+                key_order.append(key)
+                key_set.add(key)
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=key_order)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in key_order})
+    print(f"  Saved CSV -> {path}")
+
+
+def _to_float(value) -> float:
+    """Best-effort float conversion returning NaN for invalid values."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def aggregate_results_mean_std(
+    rows: List[Dict],
+    group_keys: List[str],
+    metric_keys: List[str],
+) -> List[Dict]:
+    """
+    Aggregate rows by group keys and compute mean/std for selected metrics.
+    Returns one row per unique group.
+    """
+    grouped: Dict[Tuple, List[Dict]] = defaultdict(list)
+    for row in rows:
+        grouped[tuple(row.get(k, "") for k in group_keys)].append(row)
+
+    out_rows: List[Dict] = []
+    for group_values, group_rows in grouped.items():
+        out = {k: v for k, v in zip(group_keys, group_values)}
+        out["num_runs"] = len(group_rows)
+        for key in metric_keys:
+            vals = np.array([_to_float(r.get(key, np.nan)) for r in group_rows], dtype=float)
+            vals = vals[~np.isnan(vals)]
+            if vals.size == 0:
+                out[f"{key}_mean"] = ""
+                out[f"{key}_std"] = ""
+            else:
+                out[f"{key}_mean"] = float(np.mean(vals))
+                out[f"{key}_std"] = float(np.std(vals))
+        out_rows.append(out)
+    return out_rows
+
+
+def plot_sweep_metric(
+    rows: List[Dict],
+    x_key: str,
+    series_key: str,
+    metric_key: str,
+    save_path: str,
+    title: str,
+    y_label: str,
+):
+    """
+    Plot aggregated sweep metric as line plot:
+    x-axis = x_key, one line per series_key.
+    """
+    if not rows:
+        return
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    series_values = sorted({str(r.get(series_key, "")) for r in rows}, key=lambda x: _to_float(x))
+    for i, s_val in enumerate(series_values):
+        subset = [r for r in rows if str(r.get(series_key, "")) == s_val]
+        subset_sorted = sorted(subset, key=lambda r: _to_float(r.get(x_key, "")))
+        xs = [_to_float(r.get(x_key, "")) for r in subset_sorted]
+        ys = [_to_float(r.get(f"{metric_key}_mean", np.nan)) for r in subset_sorted]
+        yerr = [_to_float(r.get(f"{metric_key}_std", np.nan)) for r in subset_sorted]
+        ax.errorbar(
+            xs,
+            ys,
+            yerr=yerr,
+            marker=MARKERS[i % len(MARKERS)],
+            color=COLORS[i % len(COLORS)],
+            linewidth=2,
+            capsize=4,
+            label=f"{series_key}={s_val}",
+        )
+
+    _style_axis(ax, x_key, y_label, title)
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    print(f"  Saved Figure -> {save_path}")
+
+
+def write_sweep_summary_text(
+    raw_rows: List[Dict],
+    aggregated_rows: List[Dict],
+    path: str,
+) -> None:
+    """Write a short, paper-friendly summary text for sweep experiments."""
+    if not raw_rows:
+        return
+
+    raw_acc = np.array([_to_float(r.get("final_accuracy", np.nan)) for r in raw_rows], dtype=float)
+    raw_acc = raw_acc[~np.isnan(raw_acc)]
+
+    raw_pixel = np.array(
+        [_to_float(r.get("final_pixel_backdoor_accuracy", np.nan)) for r in raw_rows], dtype=float
+    )
+    raw_pixel = raw_pixel[~np.isnan(raw_pixel)]
+
+    raw_semantic = np.array(
+        [_to_float(r.get("final_semantic_backdoor_accuracy", np.nan)) for r in raw_rows], dtype=float
+    )
+    raw_semantic = raw_semantic[~np.isnan(raw_semantic)]
+
+    raw_f1 = np.array([_to_float(r.get("final_defense_f1", np.nan)) for r in raw_rows], dtype=float)
+    raw_f1 = raw_f1[~np.isnan(raw_f1)]
+
+    best_acc_row = max(raw_rows, key=lambda r: _to_float(r.get("final_accuracy", -np.inf)))
+    best_f1_row = max(raw_rows, key=lambda r: _to_float(r.get("final_defense_f1", -np.inf)))
+
+    lines = [
+        "Sweep Summary",
+        "=============",
+        f"Total runs: {len(raw_rows)}",
+        "",
+        (
+            f"Final clean accuracy (mean +/- std): "
+            f"{float(np.mean(raw_acc)):.4f} +/- {float(np.std(raw_acc)):.4f}"
+            if raw_acc.size > 0
+            else "Final clean accuracy: N/A"
+        ),
+        (
+            f"Final pixel ASR (mean +/- std): "
+            f"{float(np.mean(raw_pixel)):.4f} +/- {float(np.std(raw_pixel)):.4f}"
+            if raw_pixel.size > 0
+            else "Final pixel ASR: N/A"
+        ),
+        (
+            f"Final semantic ASR (mean +/- std): "
+            f"{float(np.mean(raw_semantic)):.4f} +/- {float(np.std(raw_semantic)):.4f}"
+            if raw_semantic.size > 0
+            else "Final semantic ASR: N/A"
+        ),
+        (
+            f"Final defense F1 (mean +/- std): "
+            f"{float(np.mean(raw_f1)):.4f} +/- {float(np.std(raw_f1)):.4f}"
+            if raw_f1.size > 0
+            else "Final defense F1: N/A"
+        ),
+        "",
+        "Best clean-accuracy run:",
+        (
+            f"  seed={best_acc_row.get('seed', '')}, "
+            f"malicious_frac={best_acc_row.get('malicious_frac', '')}, "
+            f"poison_rate={best_acc_row.get('poison_rate', '')}, "
+            f"final_accuracy={_to_float(best_acc_row.get('final_accuracy', np.nan)):.4f}, "
+            f"final_semantic_ASR={_to_float(best_acc_row.get('final_semantic_backdoor_accuracy', np.nan)):.4f}, "
+            f"final_pixel_ASR={_to_float(best_acc_row.get('final_pixel_backdoor_accuracy', np.nan)):.4f}"
+        ),
+        "",
+        "Best defense-F1 run:",
+        (
+            f"  seed={best_f1_row.get('seed', '')}, "
+            f"malicious_frac={best_f1_row.get('malicious_frac', '')}, "
+            f"poison_rate={best_f1_row.get('poison_rate', '')}, "
+            f"final_defense_precision={_to_float(best_f1_row.get('final_defense_precision', np.nan)):.4f}, "
+            f"final_defense_recall={_to_float(best_f1_row.get('final_defense_recall', np.nan)):.4f}, "
+            f"final_defense_f1={_to_float(best_f1_row.get('final_defense_f1', np.nan)):.4f}"
+        ),
+        "",
+        f"Aggregated config rows: {len(aggregated_rows)}",
+    ]
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"  Saved summary text -> {path}")
