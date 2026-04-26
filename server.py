@@ -152,54 +152,6 @@ def foolsgold_aggregate(
         result.append(weighted_avg.reshape(layer_params[0].shape))
     
     return result, flagged
-    Returns aggregated parameters and indices of flagged clients.
-    """
-    if len(updates) < 2:
-        return np.array([u for u, _ in updates]), []
-
-    # Flatten each update into a vector
-    flattened = []
-    for u, _ in updates:
-        flat = np.concatenate([p.flatten() for p in u])
-        flattened.append(flat)
-    
-    flattened = np.array(flattened)
-    
-    # Compute cosine similarity matrix
-    norms = np.linalg.norm(flattened, axis=1, keepdims=True)
-    norms = np.where(norms == 0, 1e-10, norms)  # Avoid division by zero
-    normalized = flattened / norms
-    similarity_matrix = np.dot(normalized, normalized.T)
-
-    # Compute maximum similarity for each client to any other
-    np.fill_diagonal(similarity_matrix, 0)
-    max_similarities = np.max(similarity_matrix, axis=1)
-
-    # Flag clients with suspiciously high similarity
-    flagged = np.where(max_similarities > foolsgold_threshold)[0].tolist()
-
-    # Weight by inverse similarity (less similar = higher weight)
-    weights = 1.0 - max_similarities
-    weights = np.maximum(weights, 0.01)  # Ensure positive weights
-    weights = weights / weights.sum()
-
-    # Weighted average
-    aggregated = np.average(flattened, axis=0, weights=weights)
-    
-    # Reshape back to original structure
-    result = []
-    idx = 0
-    for u in updates:
-        param_shapes = [p.shape for p in u]
-        layer_sizes = [np.prod(s) for s in param_shapes]
-        layers = []
-        for shape in param_shapes:
-            size = np.prod(shape)
-            layers.append(aggregated[idx:idx+size].reshape(shape))
-            idx += size
-        result.append(np.array(layers, dtype=object))
-
-    return np.array(result, dtype=object), flagged
 
 
 class FedAvgWithEval(FedAvg):
